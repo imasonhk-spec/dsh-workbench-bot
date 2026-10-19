@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-workbench-bot",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "main": "index.js",
@@ -28,7 +28,11 @@
     }
   },
   "peerDependencies": {},
-  "scripts": { "test": "node --test test/*.test.js", "check": "node --check index.js && node --check src/client/index.js", "test:ui-races": "node --test test/ui-races.mjs" },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node --check index.js && node --check src/client/index.js",
+    "test:ui-races": "node --test test/ui-races.mjs"
+  },
   "meta": {
     "title": "DSH Bot 工作台",
     "description": "微信式多 Agent 协作悬浮窗：五个私聊 + 长期群聊 + 会议纪要到 PPT 真实协作交付。"

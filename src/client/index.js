@@ -103,7 +103,7 @@ window.__ModuleLoader__.load({
     const STEP_LABELS = { queued:'等待执行', running:'执行中', waiting_external:'等待业务结果', waiting_user:'等待回答', succeeded:'已完成', failed_retryable:'失败可重试', failed_terminal:'失败', outcome_unknown:'结果待对账', cancelled:'已取消', cancel_requested:'已请求取消', superseded:'已被新计划替代', interrupted:'已中断' }
     const OP_LABELS = { 'agent.analyze':'成员分析', 'business.prepare':'准备任务与来源', 'business.review_samples':'等待样张确认', 'meeting.read_minutes':'读取指定纪要', 'policy.preflight':'政策业务门禁', 'policy.extract':'提取政策原文', 'policy.evidence_check':'核对政策证据', 'kb.query':'检索指定项目', 'ppt.create_project':'建立 PPT 项目', 'ppt.configure':'配置页数与目标', 'ppt.add_material':'固定来源材料', 'ppt.generate_outline':'生成大纲', 'ppt.select_style':'选择模板', 'ppt.generate':'生成并检查页面', 'ppt.confirm_samples':'确认指定版本样张', 'ppt.export':'导出并验证成品', 'ppt.revise':'按要求修订文字', 'ppt.patch':'更新页面对象', 'ppt.render':'渲染检查' }
     const listeners = new Set()
-    let openMain = () => {}, mount, events, timer, stopped = false, refreshPromise, refreshResult, finishRefresh, refreshAgain = false, initialized = false
+    let openMain = () => {}, mount, events, timer, stopped = false, refreshPromise, refreshResult, finishRefresh, refreshAgain = false, initialized = false, eventTimer = null, pollTimer = null, eventRetry = 0, lastSeq = 0
     const notify = () => { for (const fn of listeners) fn() }
     const storageKey = () => `dsh.workbench.bot.v2:${state.ownerId}`
     function persist() { if (state.ownerId) try { localStorage.setItem(storageKey(), JSON.stringify({ selected: state.selected, drafts: state.drafts, pending: state.pending })) } catch { /* quota leaves in-memory drafts intact */ } }
@@ -112,6 +112,7 @@ window.__ModuleLoader__.load({
       const response = await fetch(BASE + path, { method, credentials: 'same-origin', headers: body ? { 'content-type': 'application/json' } : {}, ...(body ? { body: JSON.stringify(body) } : {}) })
       const result = await response.json()
       if (!response.ok) throw Object.assign(new Error(result.error?.message || `HTTP ${response.status}`), result.error)
+      if (!state.online) { state.online = true; notify() }
       return result
     }
     function mergeMessages(id, items) {
@@ -130,6 +131,32 @@ window.__ModuleLoader__.load({
       await Promise.allSettled(attachmentIds.filter(aid => !state.attachments[aid]).map(async aid => { state.attachments[aid] = await api('GET', `/attachments/${aid}`) }))
       if (state.selected === id && document.visibilityState === 'visible') await api('PUT', `/conversations/${id}/read`, { lastReadSeq: messages.lastSeq })
       notify()
+    }
+    function connectEvents() {
+      // EventSource 只在「网络错误」时自动重连；收到 4xx/5xx（如服务重启瞬间的 502）会永久失败，
+      // 原实现只在初始化时 new 一次，之后一直停在「连接恢复中」。这里自行重建 + 退避 + 兜底轮询。
+      try { events?.close() } catch { /* 旧连接已失效 */ }
+      events = new EventSource(`${BASE}/events?after=${lastSeq || 0}`)
+      events.onopen = () => {
+        eventRetry = 0
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+        if (!state.online) { state.online = true; notify() }
+      }
+      events.onerror = () => {
+        try { events?.close() } catch { /* 忽略 */ }
+        const wait = Math.min(15000, 1000 * (2 ** Math.min(eventRetry++, 4)))
+        clearTimeout(eventTimer)
+        eventTimer = setTimeout(() => {
+          if (stopped) return
+          refresh().catch(() => {}).finally(() => { if (!stopped) connectEvents() })
+        }, wait)
+        // SSE 断开期间仍用轮询保底，界面照常刷新
+        if (!pollTimer) pollTimer = setInterval(() => { if (!stopped) refresh().catch(() => {}) }, 8000)
+        notify()
+      }
+      const schedule = () => { clearTimeout(timer); timer = setTimeout(() => refresh().catch(() => {}), 150) }
+      events.onmessage = e => { if (e.lastEventId) lastSeq = Number(e.lastEventId) || lastSeq; schedule() }
+      events.addEventListener('reset', e => { if (e.lastEventId) lastSeq = Number(e.lastEventId) || lastSeq; schedule() })
     }
     async function refresh() {
       if (stopped) return
@@ -158,14 +185,16 @@ window.__ModuleLoader__.load({
               state.models = (await api('GET', '/models')).items
               if (stopped) return
               initialized = true
-              events = new EventSource(`${BASE}/events?after=${data.highWatermark}`)
-              events.onopen = () => { state.online = true; notify() }
-              events.onerror = () => { state.online = false; notify() }
-              const schedule = () => { clearTimeout(timer); timer = setTimeout(() => refresh().catch(() => {}), 150) }
-              events.onmessage = schedule; events.addEventListener('reset', schedule)
+              lastSeq = Number(data.highWatermark) || 0
+              state.online = true
+              connectEvents()
             }
             state.error = ''; await loadConversation(state.selected); changed()
-          } catch (error) { state.error = error.message; notify() }
+          } catch (error) {
+            // 只有网络层失败才算断线；业务错误（带 code）不影响在线状态
+            if (!error.code) state.online = false
+            state.error = error.message; notify()
+          }
           finally { finish() }
         } while (refreshAgain && !stopped) }
         finally { refreshPromise = null; if (stopped) { finishRefresh?.(); refreshResult = finishRefresh = null } }
@@ -502,7 +531,7 @@ window.__ModuleLoader__.load({
         const storage = e => { if (e.key === storageKey() && e.newValue) { try { const value = JSON.parse(e.newValue); state.drafts = { ...state.drafts, ...value.drafts }; loadConversation(state.selected); notify() } catch { /* malformed peer cache */ } } }
         window.addEventListener('storage', storage)
         const visibility = () => { if (document.visibilityState === 'visible') refresh() }; document.addEventListener('visibilitychange', visibility)
-        return () => { disposed = true; stopped = true; clearTimeout(timer); events?.close(); events = null; initialized = false; window.removeEventListener('storage', storage); document.removeEventListener('visibilitychange', visibility); delete window.__workbenchBot; style.remove(); for (const dispose of disposers) dispose?.(); listeners.clear() }
+        return () => { disposed = true; stopped = true; clearTimeout(timer); clearTimeout(eventTimer); clearInterval(pollTimer); events?.close(); events = null; initialized = false; window.removeEventListener('storage', storage); document.removeEventListener('visibilitychange', visibility); delete window.__workbenchBot; style.remove(); for (const dispose of disposers) dispose?.(); listeners.clear() }
       },
     }
   },
