@@ -4,6 +4,36 @@ import { RoleService, deduplicate, fail } from './roles.js'
 import { RunCoordinator } from './runs/coordinator.js'
 import { budgetExhausted } from './runs/budget.js'
 
+// 成员步骤被要求输出 {"contribution":"..."} 结构；群聊展示文本只保留正文，
+// 否则用户会看到 JSON 外壳与换行转义。溯源用的 responseText 仍保存原文。
+const contributionText = value => {
+  const raw = String(value ?? '')
+  const s = raw.trim()
+  if (!s || !/"contribution"\s*:/.test(s)) return raw
+  const candidates = []
+  if (s.startsWith('{')) candidates.push(s)
+  const fenced = s.match(/^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```[ \t]*$/)
+  if (fenced) candidates.push(fenced[1])
+  const loose = s.match(/\{\s*"contribution"\s*:/)
+  if (loose) candidates.push(s.slice(loose.index))
+  const pick = parsed => parsed && typeof parsed === 'object' && typeof parsed.contribution === 'string' && parsed.contribution.trim() ? parsed.contribution.trim() : null
+  // 成员偶尔输出未转义的原始换行/制表符，JSON.parse 会拒绝；先还原成合法转义再试。
+  const repair = c => c.replace(/\r\n?/g, '\\n').replace(/\t/g, '\\t').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, ' ')
+  for (const c of candidates) {
+    try { const v = pick(JSON.parse(c)); if (v) return v } catch { /* retry repaired frame */ }
+    try { const v = pick(JSON.parse(repair(c))); if (v) return v } catch { /* salvage below */ }
+  }
+  // 输出被截断时的保底：截取 contribution 字符串体并反转义。
+  const salvage = s.match(/^\s*(?:```(?:json)?[ \t]*\r?\n)?\{\s*"contribution"\s*:\s*"([\s\S]*)$/)
+  if (salvage) {
+    const body = salvage[1].replace(/"\s*\}?\s*(?:```)?\s*$/, '')
+    let v = body
+    try { v = JSON.parse('"' + body + '"') } catch { v = body.replace(/\\r/g, '').replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\') }
+    if (typeof v === 'string' && v.trim()) return v.trim()
+  }
+  return raw
+}
+
 export class BotBridge {
   constructor({ ctx, store, adapters = {}, coordinator }) {
     Object.assign(this, { ctx, store, adapters })
@@ -376,7 +406,7 @@ export class BotBridge {
         }
         if (!counted || !text || text === '[PASS]' || run.state === 'cancelled') return
         if (counted) run.usage.turns++
-        this.store.emit(scope.conversationId, 'message.committed', messageId, { messageId, sender: { type: 'agent', id: scope.agentId }, text, runId: scope.runId, upstreamSessionId: session.id })
+        this.store.emit(scope.conversationId, 'message.committed', messageId, { messageId, sender: { type: 'agent', id: scope.agentId }, text: contributionText(text), runId: scope.runId, upstreamSessionId: session.id })
         run.hasReply = true
         if (scope.stepId && this.store.state.steps[scope.stepId]?.externalJobId === scope.sessionId) this.store.state.steps[scope.stepId].responseText = text
 
