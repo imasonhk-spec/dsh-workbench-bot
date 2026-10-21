@@ -1,10 +1,15 @@
 import { fail } from '../roles.js'
 import { matchesTaskChanges } from '../runs/task-update.js'
+import { validPptPlan } from '../runs/ppt-intent.js'
+import { validPptRequirements, validPptEvidence, resolvePptEvidenceSelection, resolvePptRequirementSelection } from '../runs/ppt-admission.js'
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value)
 const text = value => typeof value === 'string' && !!value.trim()
 function validAnalysis(result, input) {
   if (!object(result)) return false
+  if (input.responseFormat === 'ppt_plan') return validPptPlan(result)
+  if (input.responseFormat === 'ppt_requirements') return input.requirementsMode === 'selection' ? !!resolvePptRequirementSelection(result, input.source) : validPptRequirements(result, input.source)
+  if (input.responseFormat === 'ppt_evidence') return input.evidenceMode === 'selection' ? !!resolvePptEvidenceSelection(result, input.source) : validPptEvidence(result, input.source)
   if (input.responseFormat === 'task_update') {
     if (result.intent === 'clarify') return true
     if (!matchesTaskChanges(result, input.requestedChanges)) return false
@@ -48,8 +53,8 @@ export class AgentAdapter {
     if (rt.eventsBackwards) for await (const event of rt.eventsBackwards(externalJobId, AbortSignal.timeout(20000), Infinity)) {
       if (event.type === 'agent/inbox/spliced' && event.data?.inserted?.some(m => m.source?.exchangeId === `${id}:${attempt}`)) queuedReceipt = true
       if (event.type.startsWith('tool/') || event.type.startsWith('llm/')) execution = true
-      if (event.type === 'turn/end') { turnReason = event.data?.reason?.kind || 'interrupted'; latestTurnReason ??= turnReason }
-      if (event.type === 'turn/start') { turnReason = undefined; latestTurnReason ??= 'interrupted' }
+      if (event.type === 'turn/end') { turnReason = event.data?.reason || { kind: 'interrupted' }; latestTurnReason ??= turnReason }
+      if (event.type === 'turn/start') { turnReason = undefined; latestTurnReason ??= { kind: 'interrupted' } }
       if (event.type === 'user/message') {
         const source = event.data?.source
         // Producer context is not a new exchange; relay/recall and opaque inputs remain boundaries.
@@ -59,12 +64,12 @@ export class AgentAdapter {
       if (event.type === 'assistant/message') {
         replies.push(event)
         const candidate = (event.data?.message?.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim()
-        if (text === undefined && candidate) { text = candidate; reason = turnReason || 'interrupted' }
+        if (text === undefined && candidate) { text = candidate; reason = turnReason || { kind: 'interrupted' } }
       }
     }
     if (!receipt) {
       const step = this.bridge.store.state.steps[id]
-      if (rt.eventsBackwards && !boundary && !replies.length && !execution && latestTurnReason === 'blocked' && Number.isInteger(step?.planRevision) && step.planRevision !== run.planRevision) {
+      if (rt.eventsBackwards && !boundary && !replies.length && !execution && latestTurnReason?.kind === 'blocked' && Number.isInteger(step?.planRevision) && step.planRevision !== run.planRevision) {
         const pending = [...(agent.inbox?.nextStep || []), ...(agent.inbox?.nextTurn || [])].filter(m => m.source?.exchangeId === `${id}:${attempt}`)
         // The old plan was blocked before its first user record; never discard uncertain executed work.
         if (pending.length === 1 && agent.inbox.remove(pending[0].id)) return { state: 'cancelled' }
@@ -73,12 +78,17 @@ export class AgentAdapter {
       return { state: 'outcome_unknown', error: { code: 'OUTCOME_UNKNOWN', message: '成员投递收据未确认，需要对账；不会盲重发' } }
     }
     for (const event of replies.reverse()) await this.bridge.recordReply(scope, { id: externalJobId }, event)
-    if ((text ? reason : latestTurnReason) !== 'completed') return { state: 'failed_retryable', error: { code: 'INTERRUPTED', message: '成员轮次未完成，不能采用部分输出' } }
+    const completion = latestTurnReason?.kind !== 'completed' ? latestTurnReason : text ? reason : latestTurnReason
+    if (completion?.kind === 'error') return { state: 'failed_retryable', error: { code: completion.error?.code || 'MODEL_REQUEST_FAILED', message: completion.error?.message || '模型请求失败，请检查所选模型及请求配置后显式重试' } }
+    if (completion?.kind === 'max-tokens') return { state: 'failed_retryable', error: { code: 'LLM_OUTPUT_TRUNCATED', message: '成员输出达到模型长度上限，不能采用部分输出；请调整模型或任务后显式重试' } }
+    if (completion?.kind !== 'completed') return { state: 'failed_retryable', error: { code: 'INTERRUPTED', message: '成员轮次未完成，不能采用部分输出' } }
     if (!text || text.trim() === '[PASS]') return { state: 'failed_retryable', error: { code: 'NO_CONTRIBUTION', message: '成员未提供可验证输出' } }
     const analysis = resolvedInput || input || {}
     try {
-      const result = JSON.parse(text.trim().replace(/^```(?:json)?\s*/, '').replace(/\s*```$/, ''))
-      if (validAnalysis(result, analysis)) return { state: 'succeeded', result }
+      // Accept one complete member result frame; competing JSON/fences outside it remain ambiguous.
+      const framed = analysis.responseFormat === 'ppt_requirements' && analysis.requirementsMode === 'selection' && text.trim().match(/^(?:[^`{}\[\]]*\r?\n)?```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```[ \t]*(?:\r?\n[^`{}\[\]]*)?$/)
+      const result = JSON.parse(framed ? framed[1] : text.trim().replace(/^```(?:json)?\s*/, '').replace(/\s*```$/, ''))
+      if (validAnalysis(result, analysis)) return { state: 'succeeded', result: analysis.responseFormat === 'ppt_requirements' && analysis.requirementsMode === 'selection' ? resolvePptRequirementSelection(result, analysis.source) : analysis.responseFormat === 'ppt_evidence' && analysis.evidenceMode === 'selection' ? resolvePptEvidenceSelection(result, analysis.source) : result }
     } catch { /* Conversational members may answer in plain text; business evidence remains typed. */ }
     if (analysis.responseFormat === 'task_update') return { state: 'succeeded', result: { intent: 'clarify', reason: '成员未返回足够且一致的分类依据，请由用户明确确认。' } }
     if (analysis.responseFormat === 'contribution') return { state: 'succeeded', result: { contribution: text.trim() } }

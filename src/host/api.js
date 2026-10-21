@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
-import { fail, deduplicate } from './roles.js'
+import { fail, deduplicate, writableConversation } from './roles.js'
 
 function sendJson(res, body, status = 200) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
@@ -48,16 +48,20 @@ export function createApi({ store, bridge, coordinator = bridge.coordinator, ada
         if (method === 'GET' && (!seg.length || seg[0] === 'bootstrap')) return sendJson(res, { enabled: false })
         throw fail('WORKBENCH_DISABLED', 'Bot 协作已停用', 404)
       }
-      if (method === 'GET' && (!seg.length || seg[0] === 'bootstrap')) return sendJson(res, {
+      if (method === 'GET' && (!seg.length || seg[0] === 'bootstrap')) {
+        await bridge.refreshCapabilities?.()
+        return sendJson(res, {
         enabled: true,
         ownerId: store.state.ownerId,
         demo: Boolean(store.state.demo),
         agents: Object.values(store.state.agents).filter(a => !a.ownerId || a.ownerId === store.state.ownerId),
-        conversations: Object.values(store.state.conversations).filter(c => c.ownerId === store.state.ownerId).map(describe),
+        conversations: Object.values(store.state.conversations).filter(c => c.ownerId === store.state.ownerId && !c.deletedAt).map(describe),
         capabilities: Object.values(adapters).map(a => a.manifest()), highWatermark: store.highWatermark(),
-      })
+        })
+      }
       if (seg[0] === 'agents') {
-        if (seg.length === 1 && method === 'GET') return sendJson(res, { items: bridge.roles.list(query.get('lifecycle') || 'active').filter(a => !query.get('q') || a.title.includes(query.get('q'))), nextCursor: null })
+        if (method === 'GET') await bridge.refreshCapabilities?.(seg[1] ? [seg[1]] : undefined)
+        if (seg.length === 1 && method === 'GET') return sendJson(res, { items: bridge.roles.list(query.get('lifecycle') || (query.get('deleted') === 'only' ? null : 'active'), query.get('deleted') || 'exclude').filter(a => !query.get('q') || a.title.includes(query.get('q'))), nextCursor: null })
         if (seg.length === 1 && method === 'POST') return sendJson(res, await bridge.createAgent(await readBody(req)), 201)
         if (seg.length === 2 && method === 'GET') return sendJson(res, bridge.roles.get(seg[1]))
         if (seg.length === 2 && method === 'PATCH') return sendJson(res, await bridge.roles.update(seg[1], await readBody(req)))
@@ -65,7 +69,7 @@ export function createApi({ store, bridge, coordinator = bridge.coordinator, ada
       }
       if (seg[0] === 'conversations') {
         if (seg.length === 1 && method === 'GET') {
-          let rows = Object.values(store.state.conversations).filter(c => c.ownerId === store.state.ownerId)
+          let rows = Object.values(store.state.conversations).filter(c => c.ownerId === store.state.ownerId && Boolean(c.deletedAt) === (query.get('deleted') === 'only'))
           if (query.get('q')) rows = rows.filter(c => (c.title + (store.messages(c.id).at(-1)?.text || '')).includes(query.get('q')))
           rows.sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id))
           const offset = Math.max(0, Number(query.get('cursor')) || 0), limit = Math.min(50, Math.max(1, Number(query.get('limit')) || 50))
@@ -73,6 +77,7 @@ export function createApi({ store, bridge, coordinator = bridge.coordinator, ada
         }
         if (seg.length === 1 && method === 'POST') return sendJson(res, await bridge.createConversation(await readBody(req)), 201)
         const conv = bridge.conversation(seg[1])
+        if (seg[2] === 'actions' && method === 'POST') return sendJson(res, await bridge.conversationAction(conv.id, await readBody(req)))
         if (seg.length === 2 && method === 'PATCH') return sendJson(res, await bridge.updateConversation(conv.id, await readBody(req)))
         if (seg.length === 2 && method === 'GET') return sendJson(res, { conversation: describe(conv), members: bridge.members(conv.id), activeRuns: Object.values(store.state.runs).filter(r => r.conversationId === conv.id && !['delivered', 'cancelled', 'failed_terminal'].includes(r.state)) })
         if (seg[2] === 'messages' && method === 'GET') {
@@ -102,16 +107,47 @@ export function createApi({ store, bridge, coordinator = bridge.coordinator, ada
           return sendJson(res, cursor)
         }
         if (seg[2] === 'model' && method === 'PUT') {
+          writableConversation(store, conv.id)
           const body = await readBody(req), aid = body.agentId || conv.directAgentId || 'chief'
           if (!bridge.members(conv.id).some(m => m.type === 'agent' && m.memberId === aid)) throw fail('NOT_A_MEMBER', '角色不属于当前会话', 403)
           const ref = body.model ?? `${body.providerId}/${body.modelId}`
           if (ref !== '' && !(await bridge.listModels()).items.some(m => m.ref === ref)) throw fail('MODEL_UNAVAILABLE', '模型不可用', 409)
           const model = await store.transaction(() => {
+            writableConversation(store, conv.id)
+            if (bridge.roles.get(aid).deletedAt) throw fail('AGENT_DELETED', '请先恢复角色', 409)
             const key = `${conv.id}:${aid}`, previous = store.state.conversationModels[key]
             if (body.expectedRevision !== (previous?.revision || 0)) throw fail('VERSION_CONFLICT', '模型配置已变化', 409)
-            return store.state.conversationModels[key] = { model: ref, revision: (previous?.revision || 0) + 1 }
+            const saved = store.state.conversationModels[key] = { model: ref, revision: (previous?.revision || 0) + 1 }
+            // 群聊里给总 Agent 选模型 = 本会话全员统一模型：成员 Bot 一起写，后续新增成员按 conv.model 继承。
+            if (conv.kind === 'group' && aid === 'chief' && ref) {
+              conv.model = ref
+              for (const member of bridge.members(conv.id)) {
+                if (member.type !== 'agent' || member.memberId === 'chief') continue
+                const memberKey = `${conv.id}:${member.memberId}`
+                const memberPrevious = store.state.conversationModels[memberKey]
+                if (memberPrevious?.model === ref) continue
+                store.state.conversationModels[memberKey] = { model: ref, revision: (memberPrevious?.revision || 0) + 1 }
+              }
+            }
+            return saved
           })
           return sendJson(res, { ...model, effectiveFromNextTurn: true })
+        }
+        if (seg[2] === 'permission' && method === 'PUT') {
+          writableConversation(store, conv.id)
+          const body = await readBody(req)
+          const allowed = ['read-only', 'workspace-write', 'danger-full-access']
+          if (!allowed.includes(body.permission)) throw fail('INVALID_PERMISSION', '请选择有效的权限档位', 400)
+          if (body.expectedRevision !== undefined && body.expectedRevision !== (conv.permissionRevision || 0)) throw fail('VERSION_CONFLICT', '权限配置已变化', 409)
+          const savedPermission = await store.transaction(() => {
+            writableConversation(store, conv.id)
+            conv.permission = body.permission
+            conv.permissionRevision = (conv.permissionRevision || 0) + 1
+            conv.updatedAt = Date.now()
+            return { permission: conv.permission, permissionRevision: conv.permissionRevision }
+          })
+          const applied = await bridge.applyConversationPermission(conv.id, body.permission)
+          return sendJson(res, { ...savedPermission, applied, effectiveFromNextTurn: true })
         }
       }
       if (seg[0] === 'contexts' && method === 'POST') {
@@ -123,6 +159,7 @@ export function createApi({ store, bridge, coordinator = bridge.coordinator, ada
           return { conversationId: conv.id, messageId: id, text: message.text, sender: message.sender, seq: message.seq }
         })
         const selection = await store.transaction(() => deduplicate(store, 'context-selection', body, () => {
+          writableConversation(store, conv.id)
           const id = `context_${randomUUID()}`
           return store.state.contextSelections[id] = { id, ownerId: conv.ownerId, sourceConversationId: conv.id, messages, createdAt: Date.now(), revision: 1 }
         }))
@@ -149,7 +186,7 @@ export function createApi({ store, bridge, coordinator = bridge.coordinator, ada
         if (seg[2] === 'samples' && seg[3] === 'content' && method === 'GET') {
           const preview = run.samplePreview
           if (!preview || query.get('version') !== preview.version) throw fail('VERSION_CONFLICT', '样张版本不匹配', 409)
-          const files = await adapters.ppt.files(preview.projectId, preview.version)
+          const files = await adapters.ppt.files(preview.projectId, preview.version, { expectedSha256: preview.sha256 })
           const page = Number(query.get('page') || 1)
           if (!Number.isInteger(page) || page < 1 || page > files.previewPaths.length) throw fail('SOURCE_NOT_FOUND', '样张页不存在', 404)
           res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' })
@@ -173,6 +210,7 @@ export function createApi({ store, bridge, coordinator = bridge.coordinator, ada
           return sendJson(res, { sourceRefs: artifact.sourceRefs || [], pageSources: artifact.pageSources || [], parentRefs: artifact.parentRefs || [], contentHash: artifact.contentHash, frozenMinutes: sources.frozenMinutes, frozenPolicy: sources.frozenPolicy, projectScope: sources.projectScope, conditionTable: sources.conditionTable, evidenceChecks: sources.evidenceChecks, evidence })
         }
         if (seg[2] === 'editor' && method === 'GET') {
+          writableConversation(store, artifact.conversationId)
           if (artifact.kind !== 'ppt' || artifact.status !== 'ready') throw fail('ARTIFACT_NOT_READY', '此成品没有 PPT 编辑项目', 409)
           if (!adapters.ppt) throw fail('PLUGIN_UNAVAILABLE', '汇文 PPT 插件未启用', 503)
           const snapshot = await adapters.ppt.invoke({ operation: 'ppt.snapshot', input: { projectId: artifact.sourceEntityId }, ownerId: store.state.ownerId })
@@ -213,7 +251,7 @@ export function createApi({ store, bridge, coordinator = bridge.coordinator, ada
       if (seg[0] === 'meetings' && seg[1] === 'candidates' && method === 'GET') return sendJson(res, await adapters.meeting.invoke({ operation: 'meeting.list_candidates', input: {}, ownerId: store.state.ownerId }))
       if (seg[0] === 'health' && method === 'GET') {
         const health = {}
-        for (const [id, adapter] of Object.entries(adapters)) { const h = adapter.health ? await adapter.health() : { status: 'ready', version: 'internal' }; health[id] = { status: h.status, version: h.version, reason: h.reason } }
+        for (const [id, adapter] of Object.entries(adapters)) { const h = bridge.registry && store.state.agents[id]?.kind === 'plugin' ? await bridge.registry.refresh(id) : adapter.health ? await adapter.health() : { status: 'ready', version: 'internal' }; health[id] = { status: h.status, version: h.version, reason: h.reason } }
         return sendJson(res, health)
       }
       if (seg[0] === 'events' && method === 'GET') {

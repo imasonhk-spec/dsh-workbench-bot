@@ -2,6 +2,10 @@
 // 路由映射见 docs/api-map.md；真实路由表见 huiwen-ppt/server/router.js。
 import { MANIFESTS, adapterError } from './base.js'
 import { ensureReady, core, callApi, sourceModule, packageVersion, assertPptScope } from './inproc.js'
+import { join } from 'node:path'
+import { readFile } from 'node:fs/promises'
+import { createReadStream } from 'node:fs'
+import { createHash } from 'node:crypto'
 
 export class PptAdapter {
   constructor({ call = callApi, ready = ensureReady, modules = sourceModule, ctx } = {}) {
@@ -123,16 +127,19 @@ export class PptAdapter {
       case 'ppt.configure': {
         const brief = await this.modules('brief')
         // Native outline/content prompts read key_message; notes alone is absent from briefSummary.
-        await brief.saveBriefDraft(input.projectId, { title: input.title, page_count: input.pageCount, notes: input.notes || '', key_message: input.notes || '', audience: input.audience || '项目团队', material_policy: 'provided' })
+        await brief.saveBriefDraft(input.projectId, { title: input.title, page_count: input.pageCount, notes: input.notes || '', key_message: input.notes || '', user_instructions: input.userInstructions || input.notes || '', audience: input.audience || '项目团队', material_policy: 'provided' })
         await brief.confirmBrief(input.projectId, '工作台用户委托', '依据本次用户任务保存需求')
         return { projectId: input.projectId }
       }
       case 'ppt.confirm_samples':
-        return this._call(`/api/projects/${input.projectId}/samples/confirm`, { method: 'POST', body: { version: input.version, sha256: input.sha256, confirmed_by: '工作台用户', note: input.note } })
+        return this._call(`/api/projects/${input.projectId}/samples/confirm`, { method: 'POST', body: { version: input.version, sha256: input.sha256, confirmed_by: '工作台用户', note: input.note, requirement_review: input.requirement_review } })
       case 'ppt.snapshot':
         return this._call(`/api/projects/${input.projectId}/snapshot`)
-      case 'ppt.export':
-        return this._call(`/api/projects/${input.projectId}/export`, { method: 'POST', body: {} })
+      case 'ppt.export': {
+        const result = await this._call(`/api/projects/${input.projectId}/export`, { method: 'POST', body: {} })
+        if (result.document_state !== 'final') throw adapterError('PPT_NOT_FINAL', '当前文件尚未定稿，请预览草稿并核实要求后确认', { status: 409 })
+        return result
+      }
       case 'ppt.patch':
         return this._call(`/api/projects/${input.projectId}/patch`, { method: 'POST', body: { version: input.version, expected_sha256: input.sha256, operations: input.operations, source: 'workbench', note: input.note } })
       case 'ppt.revise': {
@@ -156,13 +163,26 @@ export class PptAdapter {
     return { state, rawStatus: job.status, result: job.result, error: job.error }
   }
 
-  async files(projectId, version) {
+  async files(projectId, version, { expectedSha256 } = {}) {
     await this.ready()
-    const { dir, meta } = await (await sourceModule('projects')).loadProject(projectId)
-    if (meta.version !== version) throw adapterError('VERSION_CONFLICT', 'PPT 版本已更新，请刷新')
-    const snapshot = await this._call(`/api/projects/${projectId}/snapshot`)
-    const file = await (await sourceModule('exporter')).downloadVersion(projectId, { version })
-    return { path: file.path, previewPaths: (snapshot.report?.render_pngs || []).map(p => `${dir}/${p}`), snapshot }
+    if (!/^v\d{4,}$/.test(version || '')) throw adapterError('SOURCE_NOT_FOUND', 'PPT 版本无效', { status: 404 })
+    const boundRead = expectedSha256 !== undefined
+    if (boundRead && !/^[a-f0-9]{64}$/.test(expectedSha256 || '')) throw adapterError('SOURCE_HASH_MISMATCH', '缺少有效的草稿版本校验值', { status: 409 })
+    const { dir, meta } = await (await this.modules('projects')).loadProject(projectId)
+    if (meta.version !== version && !boundRead) throw adapterError('VERSION_CONFLICT', 'PPT 版本已更新，请刷新', { status: 409 })
+    const file = await (await this.modules('exporter')).downloadVersion(projectId, { version })
+    const snapshot = boundRead ? undefined : await this._call(`/api/projects/${projectId}/snapshot`)
+    let report = snapshot?.report
+    if (boundRead) {
+      try { report = JSON.parse(await readFile(join(dir, `report-${version}.json`), 'utf8')) } catch { report = null }
+      if (!report) throw adapterError('SOURCE_NOT_FOUND', '此版本页面报告缺失', { status: 404 })
+      const hash = createHash('sha256')
+      for await (const chunk of createReadStream(file.path)) hash.update(chunk)
+      if (report.version !== version || report.sha256 !== expectedSha256 || hash.digest('hex') !== expectedSha256) throw adapterError('SOURCE_HASH_MISMATCH', '此版本草稿与保存的校验值不一致', { status: 409 })
+      // Historical reads may use only that version's renders, never a current snapshot or another path.
+      if (!Array.isArray(report.render_pngs) || !report.render_pngs.length || report.render_pngs.some(p => typeof p !== 'string' || !new RegExp(`^renders/${version}/slide-\\d+\\.png$`).test(p))) throw adapterError('SOURCE_NOT_FOUND', '此版本页面路径无效', { status: 404 })
+    }
+    return { path: file.path, previewPaths: (report?.render_pngs || []).map(p => join(dir, p)), snapshot }
   }
   async cancel({ stepId, externalJobId }) {
     await this.ready()

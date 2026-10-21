@@ -23,10 +23,21 @@ export class CapabilityRegistry {
   }
   async refresh(id) {
     const record = this.registered.get(id)
+    if (record?.pendingHealth) return record.pendingHealth
+    const pending = this.probe(id, record)
+    if (!record) return pending
+    record.pendingHealth = pending
+    try { return await pending }
+    finally { if (record.pendingHealth === pending) delete record.pendingHealth }
+  }
+  async probe(id, record) {
     const health = record ? await record.adapter.health().catch(error => ({ status: 'unavailable', reason: error.message })) : { status: 'unavailable', reason: '业务插件已卸载' }
     await this.store.transaction(() => {
+      // A removed/replaced registration owns its own readiness.
+      if (this.registered.get(id) !== record) return
       const agent = this.store.state.agents[id]
-      if (agent) { agent.health = health.status === 'ready' && agent.botId ? 'ready' : 'unavailable'; agent.healthReason = health.reason; this.store.emit(null, 'agent.updated', id, agent) }
+      const status = health.status === 'ready' && agent?.botId ? 'ready' : 'unavailable'
+      if (agent && (agent.health !== status || agent.healthReason !== health.reason)) { agent.health = status; agent.healthReason = health.reason; this.store.emit(null, 'agent.updated', id, agent) }
     })
     return health
   }

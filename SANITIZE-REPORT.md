@@ -1,7 +1,7 @@
-# 脱敏报告 · dsh-workbench-bot 0.1.1
+# 脱敏报告 · dsh-workbench-bot 0.1.2
 
 - 来源: `/home/lgsj/.dsh/profiles/web/node_modules/@local/dsh-workbench-bot`（8.6 线上活副本）
-- 文件数: 29
+- 文件数: 33
 
 ## 密钥/Token/密码: 0 个文件
 

@@ -21,7 +21,7 @@ import { BusinessTasks } from './src/host/runs/business.js'
 import { AgentAdapter } from './src/host/adapters/agent.js'
 import { GeneralCapabilities } from './src/host/general.js'
 
-export const inject = ['webServer', 'tools', 'dsBotRt', 'connection']
+export const inject = ['webServer', 'tools', 'dsBotRt', 'connection', 'llm']
 
 export function apply(ctx, config = {}) {
   if (config.enabled === false) {

@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto'
 import { accountRunTime } from './runs/budget.js'
 
 const EMPTY_STATE = () => ({
-  version: 2,
+  version: 3,
   highWatermark: 0,
   revision: 0,
   agents: {},            // agentId -> AgentDefinition
@@ -70,10 +70,19 @@ export class StateStore {
     try {
       const raw = await fsp.readFile(this.statePath, 'utf8')
       const parsed = JSON.parse(raw)
-      if (![1, 2].includes(parsed?.version)) throw Object.assign(new Error('Unsupported state version'), { code: 'SCHEMA_UNSUPPORTED' })
-      this.state = { ...EMPTY_STATE(), ...parsed, version: 2 }
+      if (![1, 2, 3].includes(parsed?.version)) throw Object.assign(new Error('Unsupported state version'), { code: 'SCHEMA_UNSUPPORTED' })
+      this.state = { ...EMPTY_STATE(), ...parsed, version: 3 }
+      if (parsed.version < 3) {
+        await fsp.copyFile(this.statePath, this.statePath + `.v${parsed.version}-backup`, fsp.constants.COPYFILE_EXCL).catch(e => { if (e.code !== 'EEXIST') throw e })
+        for (const row of [...Object.values(this.state.agents), ...Object.values(this.state.conversations)]) {
+          row.deletedAt ??= null; row.deletedBy ??= null
+        }
+      }
       // A restored process has no live execution interval; retain only committed active time.
-      for (const run of Object.values(this.state.runs)) run.activeSince = null
+      for (const run of Object.values(this.state.runs)) {
+        run.activeSince = null
+        for (const activity of Object.values(run.activity || {})) { activity.phase = 'unknown'; activity.streamRevision = -1 }
+      }
       this._seq = Math.max(parsed.highWatermark || 0, ...this.state.events.map(e => e.seq || 0), 0)
       this.state.highWatermark = this._seq
       if (parsed.version === 1) {
@@ -209,6 +218,9 @@ export function ensureDefaultConversations(store, ownerId, { demo = process.env.
       revision: 1,
       lastSeq: 0,
       archived: false,
+      permission: 'danger-full-access',
+      permissionRevision: 1,
+      deletedAt: null, deletedBy: null,
     }
     store.state.memberships[`${id}:${ownerId}`] = {
       conversationId: id, memberId: 'user', type: 'user', role: 'owner', joinedAt: Date.now(),
@@ -233,6 +245,7 @@ export function ensureDefaultConversations(store, ownerId, { demo = process.env.
         revision: 1,
         lastSeq: 0,
         archived: false,
+        deletedAt: null, deletedBy: null,
         isDemo: true,
       }
       store.state.memberships[`${demoId}:${ownerId}`] = { conversationId: demoId, memberId: 'user', type: 'user', role: 'owner', joinedAt: Date.now() }

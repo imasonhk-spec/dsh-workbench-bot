@@ -3,9 +3,8 @@ import { mkdir, writeFile, readFile } from 'node:fs/promises'
 import { resolve, extname } from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { deduplicate, fail } from './roles.js'
+import { deduplicate, fail, writableConversation } from './roles.js'
 import { getToolRuntime } from './adapters/tool-dispatch.js'
-import { budgetExhausted } from './runs/budget.js'
 import { validateScope } from './adapters/index.js'
 import { validateInput } from './adapters/input.js'
 
@@ -19,7 +18,6 @@ export class GeneralCapabilities {
     const run = this.store.state.runs[scope.runId]
     if (!run || run.ownerId !== scope.ownerId || run.conversationId !== scope.conversationId) throw fail('SOURCE_NOT_FOUND', '任务不可访问', 404)
     if (scope.stepId || run.state !== 'running' || run.kind === 'business') throw fail('DELEGATION_DENIED', '仅当前普通任务的主执行会话可调用此入口', 409)
-    if (budgetExhausted(run)) throw fail('BUDGET_EXHAUSTED', '任务预算已用尽', 409)
     return run
   }
   async taskOperation(scope, { adapterId, operation, input, requestInput = input, stepId }, exec) {
@@ -67,7 +65,11 @@ export class GeneralCapabilities {
     const conversation = this.bridge.conversation(scope.conversationId)
     if (conversation.kind !== 'group' || args.agentId === 'chief' || !this.bridge.members(conversation.id).some(m => m.type === 'agent' && m.memberId === args.agentId)) throw fail('NOT_A_MEMBER', '只能调用当前群中的业务成员', 403)
     if (typeof args.goal !== 'string' || !args.goal.trim() || args.goal.length > 16000) throw fail('INVALID_TASK', '请填写成员任务')
-    await this.store.transaction(() => { this.task(scope); run.participantAgentIds = [...new Set([...run.participantAgentIds, args.agentId])] })
+    await this.store.transaction(() => {
+      this.task(scope)
+      if (this.bridge.roles.get(args.agentId).deletedAt && !this.store.state.runParticipants[`${run.id}:${args.agentId}`]) throw fail('AGENT_DELETED', '成员已删除，不能新增任务参与者', 409)
+      run.participantAgentIds = [...new Set([...run.participantAgentIds, args.agentId])]
+    })
     return this.taskOperation(scope, { adapterId: 'agent', operation: 'agent.analyze', requestInput: { agentId: args.agentId, goal: args.goal }, input: { agentId: args.agentId, responseFormat: 'contribution', goal: `${args.goal}\n只输出有效 JSON {"contribution":"你的结论与依据"}，不要代其他成员发言。`, source: JSON.stringify({ task: run.taskSpec.goal, history: this.store.messages(conversation.id).slice(-50).map(m => ({ sender: m.sender, text: m.text })), attachmentIds: run.attachmentIds, inputRefs: run.inputRefs }) } }, exec)
   }
   async capability(scope, args, exec = {}) {
@@ -111,6 +113,8 @@ export class GeneralCapabilities {
     const conversation = this.store.state.conversations[scope.conversationId]
     if (!conversation || scope.ownerId !== this.store.state.ownerId || conversation.ownerId !== scope.ownerId) throw fail('SOURCE_NOT_FOUND', '材料不可访问', 404)
     const run = this.store.state.runs[scope.runId], step = this.store.state.steps[scope.stepId]
+    if (conversation.deletedAt && !run?.startedAt) throw fail('CONVERSATION_DELETED', '会话已删除，请先恢复', 409)
+    if (this.store.state.agents[scope.agentId]?.deletedAt && !(run?.startedAt && this.store.state.runParticipants[`${run.id}:${scope.agentId}`])) throw fail('AGENT_DELETED', '角色已删除，请先恢复', 409)
     if (run && (run.state === 'cancelled' || step && step.planRevision !== run.planRevision)) throw fail('INTERRUPTED', '此任务或步骤已停止')
     return conversation
   }
@@ -130,6 +134,7 @@ export class GeneralCapabilities {
       if (!['.txt', '.md', '.docx', '.pdf'].includes(ext)) throw fail('UNSUPPORTED_ATTACHMENT', '当前解析支持 TXT、Markdown、DOCX 和文本 PDF；旧 DOC/OCR 未启用', 415)
       const request = { ...body, dataBase64: undefined, contentHash: digest(bytes) }
       const attachment = await this.store.transaction(() => deduplicate(this.store, 'attachment', request, () => {
+        writableConversation(this.store, body.conversationId)
         const id = `att_${randomUUID()}`
         const row = { id, ...scope, name: body.name, size: bytes.length, contentHash: digest(bytes), state: 'processing', version: digest(bytes), path: resolve(this.store.home, 'attachments', id + ext), textPath: resolve(this.store.home, 'attachments', id + '.parsed.txt') }
         this.store.state.attachments[id] = row
@@ -232,7 +237,7 @@ export class GeneralCapabilities {
       ['workbench_read_attachment', '读取当前会话或本任务明确授权的附件、Markdown/DOCX 成品正文与版本。', { id: { type: 'string' } }, ['id'], (scope, args) => this.readAttachment(scope, args.id)],
       ['workbench_web_search', '联网检索并返回真实来源；失败时不得编造链接。', { query: { type: 'string' } }, ['query'], (scope, args, exec) => this.webSearch(scope, args.query, exec)],
       ['workbench_write_document', '生成或修改真实 Markdown/DOCX 文档；旧版本保留。', { title: { type: 'string' }, text: { type: 'string' }, format: { type: 'string', enum: ['md', 'docx'] }, parentArtifactId: { type: 'string' } }, ['title', 'text', 'format'], (scope, args, exec) => this.writeDocument(scope, { ...args, clientRequestId: `${scope.runId}:${exec.callId || digest(Buffer.from(JSON.stringify(args)))}` })],
-      ['workbench_business_task', '仅在用户要求 PPT 交付时交接会议/政策业务链。单能力问答使用 workbench_capability，不得擅自添加 PPT。', { goal: { type: 'string' }, project: { type: 'string' }, minutesId: { type: 'string' } }, ['goal'], (scope, args) => this.bridge.requestBusiness(scope, args)],
+      ['workbench_business_task', '用户要求PPT时交接总Agent：按自然语言、授权上下文和附件正文判断材料充分性，按需直接生成、检索、协作或追问；不强制会议/政策流程。单能力问答使用workbench_capability，不得擅自添加PPT。', { goal: { type: 'string' }, project: { type: 'string' }, minutesId: { type: 'string' } }, ['goal'], (scope, args) => this.bridge.requestBusiness(scope, args)],
       ['workbench_delegate', '总 Agent 调用当前群的真实成员并获取结果。未完成时用返回的 stepId 查询，禁止代写成员结论；成员不能再次委派。', { agentId: { type: 'string' }, goal: { type: 'string' }, stepId: { type: 'string' } }, [], (scope, args, exec) => this.delegate(scope, args, exec)],
       ['workbench_capability', '调用已注册的单能力操作；不传 operation 获取操作及输入约束。知识库必须指定项目范围；政策抽取必须先通过同一附件的公开性门禁。用 stepId 查询在途结果，不要重发写操作。', { operation: { type: 'string' }, input: { type: 'object', additionalProperties: true }, stepId: { type: 'string' } }, [], (scope, args, exec) => this.capability(scope, args, exec)],
     ]

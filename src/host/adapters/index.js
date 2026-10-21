@@ -85,12 +85,12 @@ export class KbAdapter {
     return { status: h.status, version: '1.0.0', detail: h.detail }
   }
 
-  async invoke({ operation, input, signal }) {
+  async invoke({ operation, input, signal, onAccepted }) {
     // 1) 优先 ctx.tools（rag_* 工具，token/端口全自动）
     if (operation === 'kb.query') {
       const scope = validateScope(input.scope)
       const args = { query: input.query, mode: input.mode, only_need_context: true, ...scope }
-      const r = await callTool(this.ctx, 'rag_query', args, signal)
+      const r = await this.callRemoteTool('rag_query', args, signal)
       if (r !== undefined) return { answer: r, scope, via: 'ctx.tools' }
     } else if (operation === 'kb.list_docs') {
       const r = await callTool(this.ctx, 'rag_docs', {}, signal)
@@ -99,7 +99,7 @@ export class KbAdapter {
       const r = await callTool(this.ctx, 'rag_status', {}, signal)
       if (r !== undefined) return { status: r, via: 'ctx.tools' }
     } else if (operation === 'kb.ingest') {
-      const r = await callTool(this.ctx, 'rag_ingest', input, signal)
+      const r = await this.callRemoteTool('rag_ingest', input, signal)
       if (r !== undefined) return { ingest: r, via: 'ctx.tools' }
     }
 
@@ -112,7 +112,8 @@ export class KbAdapter {
           only_need_context: true,
           scope: validateScope(input.scope),
         }
-        const taskId = await this.sidecar.startTask('query', params)
+        const taskId = await this.startTask('query', params)
+        await onAccepted?.(taskId)
         const result = await this.sidecar.waitTask(taskId, { signal })
         return { mode: result?.mode, answer: result?.result?.answer ?? result?.answer ?? result, scope: input.scope, externalTaskId: taskId, via: 'sidecar' }
       }
@@ -122,7 +123,8 @@ export class KbAdapter {
       }
       case 'kb.ingest': {
         const params = { path: input.path, ...(input.title ? { title: input.title } : {}) }
-        const taskId = await this.sidecar.startTask('ingest', params)
+        const taskId = await this.startTask('ingest', params)
+        await onAccepted?.(taskId)
         return { taskId, op: 'ingest', via: 'sidecar' }
       }
       case 'kb.status': {
@@ -131,6 +133,37 @@ export class KbAdapter {
       default:
         throw adapterError('PLUGIN_UNAVAILABLE', `unknown operation: ${operation}`)
     }
+  }
+
+  async callRemoteTool(name, input, signal) {
+    try { return await callTool(this.ctx, name, input, signal) }
+    catch (error) {
+      throw Object.assign(adapterError('OUTCOME_UNKNOWN', `知识库工具未提供远端停止收据：${error.message}`), { remoteOutcomeUnknown: true })
+    }
+  }
+
+  async startTask(operation, params) {
+    try {
+      const taskId = await this.sidecar.startTask(operation, params)
+      if (typeof taskId !== 'string' || !taskId) throw new Error('知识库未返回任务身份')
+      return taskId
+    } catch (error) {
+      throw Object.assign(adapterError('OUTCOME_UNKNOWN', `知识库提交结果不明：${error.message}`), { remoteOutcomeUnknown: true })
+    }
+  }
+
+  async cancel({ externalJobId }) {
+    if (!externalJobId) throw adapterError('CANCEL_UNSUPPORTED', '知识库任务身份未知')
+    await this.sidecar.cancelTask(encodeURIComponent(externalJobId))
+  }
+
+  async reconcile({ externalJobId, resolvedInput, input }) {
+    const task = await this.sidecar.getTask(encodeURIComponent(externalJobId))
+    const rawStatus = task?.state ?? task?.status
+    if (['done', 'succeeded', 'complete'].includes(rawStatus)) return { state: 'succeeded', rawStatus, result: { answer: task?.result?.answer ?? task?.answer ?? task, scope: (resolvedInput ?? input)?.scope, externalTaskId: externalJobId, via: 'sidecar' } }
+    if (['error', 'failed'].includes(rawStatus)) return { state: 'failed_terminal', rawStatus, error: { code: 'KB_TASK_FAILED', message: String(task.error || '知识库任务失败') } }
+    if (rawStatus === 'cancelled') return { state: 'cancelled', rawStatus }
+    return { state: 'outcome_unknown', rawStatus }
   }
 }
 
