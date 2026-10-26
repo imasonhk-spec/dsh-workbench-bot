@@ -21,14 +21,24 @@ import { BusinessTasks } from './src/host/runs/business.js'
 import { AgentAdapter } from './src/host/adapters/agent.js'
 import { GeneralCapabilities } from './src/host/general.js'
 
+import { installLicense } from './license-http.mjs'; /* PATCH:V5-o2pack-import */
 export const inject = ['webServer', 'tools', 'dsBotRt', 'connection', 'llm']
 
 export function apply(ctx, config = {}) {
+  /* PATCH:V5-o2pack-apply */
+  // 授权门禁（C 形态：本插件无 disposers）：插在 apply 最开头，
+  // 保证任何注册/初始化之前门禁就已经可用；清理走 ctx.effect。
+  const __lic = installLicense(ctx, { pluginId: 'workbench-bot', prefix: '/api/workbench-bot/v1' });
+  try { if (ctx && typeof ctx.effect === 'function') ctx.effect(() => () => { try { __lic.gate.flush(); } catch {} }, 'lic-flush'); } catch {}
+
   if (config.enabled === false) {
     const api = createApi({ bridge: { ctx }, ctx, enabled: false })
     const dispose = ctx.get('webServer')?.register({
       kind: 'prefix', path: '/api/workbench-bot/v1',
-      handler: (req, res) => api.handle(req, res, new URL(req.url, 'http://localhost').pathname, req.method),
+      handler: (req, res) => {
+        if (__lic.intercept(req, res)) return; /* PATCH:V5-o2pack-guard */
+        return (api.handle(req, res, new URL(req.url, 'http://localhost').pathname, req.method));
+      },
     })
     ctx.effect(() => dispose, 'workbench-bot: disabled cleanup')
     return
@@ -81,6 +91,7 @@ export function apply(ctx, config = {}) {
       kind: 'prefix',
       path: '/api/workbench-bot/v1',
       handler: async (req, res) => {
+        if (__lic.intercept(req, res)) return; /* PATCH:V5-o2pack-guard */
         try { await ready } catch { res.writeHead(503, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { code: 'STATE_UNAVAILABLE', message: '协作状态未就绪，请检查诊断日志' } })); return }
         const url = new URL(req.url, 'http://localhost')
         await api.handle(req, res, url.pathname, req.method)
