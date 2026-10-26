@@ -44,7 +44,7 @@ function json(res, code, obj) {
  * @param {number} [o.poolTarget] 在线领票池目标（离线包场景可忽略）
  * @param {function} [o.logger]
  */
-export function installLicense(ctx, { pluginId, prefix, poolTarget = 100, logger = () => {} } = {}) {
+export function installLicense(ctx, { pluginId, prefix, poolTarget = 100, logger = () => {}, standalone = false } = {}) {
   const base = prefix.replace(/\/+$/, '') + '/license';
   let gate;
   try {
@@ -108,7 +108,7 @@ export function installLicense(ctx, { pluginId, prefix, poolTarget = 100, logger
     }
   }
 
-  // 同步判定 + 异步处理：插在业务 handler 最前面，一行 `if (lic.intercept(req, res)) return;`
+  // 同步判定 + 异步处理：只接管 /license/* 路径，不判断业务授权
   function intercept(req, res) {
     let p = '';
     try { p = new URL(req.url, 'http://localhost').pathname; } catch { return false; }
@@ -117,8 +117,90 @@ export function installLicense(ctx, { pluginId, prefix, poolTarget = 100, logger
     return true;
   }
 
+  // ---- 业务门禁（同步，插在 handler 第一行：`if (__lic.guard(req, res)) return;`）----
+  //
+  // ⚠️ 为什么必须是同步的，而不是 `await gate.allow()`：
+  //   1) 已上机的 handler 形态各异（块式 / async 箭头 / 非 async 箭头返回 promise），
+  //      往非 async 函数里插 `await` 会直接产生语法错误；
+  //   2) allow() 每调一次消耗一张票 —— 前端一次页面加载几十个请求，100 张票撑不过一屏。
+  // 所以这里用「2 秒轮询缓存 usable」的软门禁：有证有票就放行，不烧票；
+  // 票池的消耗仍由业务侧的显式 allow()（工具型 execute）或在线 sync 核销负责。
+  let usableNow = false;
+  let warmed = false;
+  let warmTimer = null;
+  async function refresh() {
+    try {
+      const st = await gate.state();
+      usableNow = !!st.usable;
+    } catch {
+      usableNow = true;   // gate.state 自身抛错 → fail-open（L-A：授权层不能拖垮宿主）
+    }
+    warmed = true;
+  }
+  refresh();
+  try {
+    warmTimer = setInterval(refresh, 2000);
+    if (warmTimer.unref) warmTimer.unref();
+  } catch {}
+
+  /**
+   * 业务门禁：命中授权路径交给授权层；否则判授权，未授权回 402。
+   * @returns {boolean} true = 请求已被处理（调用方立刻 return），false = 继续走业务
+   */
+  function guard(req, res) {
+    if (intercept(req, res)) return true;
+    if (!warmed || usableNow) return false;
+    const st = { plugin_id: pluginId };
+    json(res, 402, {
+      ok: false,
+      code: 'LICENSE_REQUIRED',
+      message: '本插件需要有效授权。请打开 ' + base + '/ui 查看机器码并激活，或联系服务商导入离线激活包。',
+      plugin_id: pluginId,
+      license_url: base + '/ui',
+      state: st,
+    });
+    return true;
+  }
+
+  function dispose() {
+    try { if (warmTimer) clearInterval(warmTimer); } catch {}
+  }
+
+  // ---- 工具型插件（无 HTTP 业务前缀）：自己注册 /api/<id>/license ----
+  // 工具型只有 ctx.tools.execute 一个入口，installer 没有现成的 handler 可挂 intercept，
+  // 客户在现场就没有任何办法看机器码/导入离线包。这里补一个只服务授权路径的 prefix。
+  let ownRoute = null;
+  if (standalone) {
+    try {
+      const ws = ctx && (ctx.webServer || (ctx.get && ctx.get('webServer')));
+      if (ws && typeof ws.register === 'function') {
+        ownRoute = ws.register({
+          kind: 'prefix',
+          path: base,
+          handler: (req, res) => {
+            if (intercept(req, res)) return;
+            json(res, 404, { ok: false, error: 'not_found' });
+          },
+        });
+      } else {
+        logger('[license] standalone 请求注册授权路由，但 ctx 上没有 webServer');
+      }
+    } catch (e) {
+      logger('[license] standalone 注册失败（不影响 allow 门禁）', e && e.message);
+    }
+  }
+
   // 释放（插件卸载时调用；心跳定时器 unref 了，不释放也不会阻塞退出）
-  return { gate, handle, intercept, prefix: base };
+  return {
+    gate, handle, intercept, guard, dispose, refresh, prefix: base,
+    disposeRoute: () => {
+      try {
+        if (typeof ownRoute === 'function') ownRoute();
+        else if (ownRoute && typeof ownRoute.dispose === 'function') ownRoute.dispose();
+        else if (ownRoute && typeof ownRoute.unregister === 'function') ownRoute.unregister();
+      } catch {}
+    },
+  };
 }
 
 // ---- 自带激活页（零依赖、内联；现场浏览器打开 /api/<plugin>/license/ui）----

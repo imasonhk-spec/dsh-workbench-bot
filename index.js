@@ -36,7 +36,7 @@ export function apply(ctx, config = {}) {
     const dispose = ctx.get('webServer')?.register({
       kind: 'prefix', path: '/api/workbench-bot/v1',
       handler: (req, res) => {
-        if (__lic.intercept(req, res)) return; /* PATCH:V5-o2pack-guard */
+        if (__lic.guard(req, res)) return; /* PATCH:V5-o2pack-guard */
         return (api.handle(req, res, new URL(req.url, 'http://localhost').pathname, req.method));
       },
     })
@@ -91,7 +91,7 @@ export function apply(ctx, config = {}) {
       kind: 'prefix',
       path: '/api/workbench-bot/v1',
       handler: async (req, res) => {
-        if (__lic.intercept(req, res)) return; /* PATCH:V5-o2pack-guard */
+        if (__lic.guard(req, res)) return; /* PATCH:V5-o2pack-guard */
         try { await ready } catch { res.writeHead(503, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { code: 'STATE_UNAVAILABLE', message: '协作状态未就绪，请检查诊断日志' } })); return }
         const url = new URL(req.url, 'http://localhost')
         await api.handle(req, res, url.pathname, req.method)
