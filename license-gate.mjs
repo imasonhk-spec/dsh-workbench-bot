@@ -71,15 +71,30 @@ export const verifyTicketBlob = (o) => isTicket(o);
 export const machineHwid = () => hwid();
 
 // ---- 设备身份 ----
+function __wbInstHwid(base) {
+  /* WB-INST-HWID: 一实例一证 —— 账号实例（DSH_HOME 独立于 ~/.dsh）派生独立设备身份；
+     主实例（DSH_HOME == ~/.dsh 或未设置）原样返回，已有证与票池不受影响。 */
+  try {
+    const raw = String((typeof process !== 'undefined' && process.env && process.env.DSH_HOME) || '').trim();
+    if (!raw) return base;
+    const root = path.resolve(os.homedir(), '.dsh');
+    const dsh = path.resolve(raw);
+    if (dsh === root) return base;
+    const rel = dsh.indexOf(root + path.sep) === 0
+      ? path.relative(root, dsh).split(path.sep).join('/')
+      : sha256(dsh).slice(0, 16);
+    return sha256('inst:' + base + '|' + rel);
+  } catch (e) { return base; }
+}
 function hwid() {
   for (const f of ['/etc/machine-id', '/var/lib/dbus/machine-id', '/sys/class/dmi/id/product_uuid']) {
     try {
       const v = fs.readFileSync(f, 'utf-8').trim();
-      if (v && v.length >= 8) return sha256('mid:' + v.toLowerCase());
+      if (v && v.length >= 8) return __wbInstHwid(sha256('mid:' + v.toLowerCase()));
     } catch {}
   }
   const cpus = os.cpus();
-  return sha256('fallback:' + os.hostname() + '|' + (cpus[0] && cpus[0].model || '') + '|' + os.userInfo().username);
+  return __wbInstHwid(sha256('fallback:' + os.hostname() + '|' + (cpus[0] && cpus[0].model || '') + '|' + os.userInfo().username));
 }
 
 function deviceKeys(dir) {
@@ -109,14 +124,58 @@ class Clock {
 }
 
 // ---- 门禁 ----
-export function createGate({ pluginId, dataDir, poolTarget = 100, lowWater = 10, logger = () => {}, server = SERVER, hwid: hwidOverride } = {}) {
+export function createGate({ pluginId, dataDir, poolTarget = 500, lowWater = 50, logger = () => {}, server = SERVER, hwid: hwidOverride } = {}) {
   const dir = dataDir || path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), '.cache', '.s');
   const hw = hwidOverride || hwid();        // hwidOverride 仅供单测/排障，生产勿传
   const clock = new Clock(path.join(dir, '.clock'));
   const gate = { pluginId, hwid: hw, server };
 
   let key = null, lic = null, pool = [], maxUsedSeq = 0, ackedSeq = 0;
+  /* WB-TICKET-FREE: 服务端逐插件下发「不约束票券」时，就不再领票/扣票。
+     ticketFree 由任意服务端响应里的 ticket_free 同步；usageCount 是旁路期的调用计数
+     （票不消耗了，但「用了几次」仍要能统计，随心跳 ops_used 上报）。 */
+  let ticketFree = false, usageCount = 0, saveNoMerge = false;
+
+  /* WB-POOL-CAP: 跟随服务端下发的容量（pool_cap），语义与工作台 _applyServerTime 一致。
+     服务端调低容量时这里同步收紧；null/0 表示不限，保持本地默认。 */
+  function applyCap(d) {
+    try {
+      if (!d || d.pool_cap == null) return;
+      const c = +d.pool_cap;
+      if (!(c > 0)) return;
+      if (poolTarget !== c) {
+        poolTarget = c;
+        lowWater = Math.max(10, Math.min(lowWater, Math.max(10, Math.round(c * 0.1))));
+      }
+    } catch {}
+  }
+
+  /* WB-TICKET-FREE：服务端票券策略同步。
+     on  : 进入旁路 —— 清空本地票池（服务端已 acked=issued，这些票作废），之后只看有效期
+     off : 恢复票券 —— 把 refill 节流归零并立刻补票，用户无需重新激活 */
+  function applyTicketFree(d) {
+    try {
+      if (!d || d.ticket_free == null) return;
+      const on = !!d.ticket_free;
+      if (on && !ticketFree) {
+        pool = []; ackedSeq = Math.max(ackedSeq, maxUsedSeq);
+        saveNoMerge = true; save();
+        logger('ticket_free on: local pool cleared', { was: pool.length });
+      } else if (!on && ticketFree) {
+        lastRefillAt = 0;
+        logger('ticket_free off: resuming ticket pool');
+        refill().catch(() => {});
+      }
+      ticketFree = on;
+    } catch {}
+  }
+  // 待上报的操作数：票券模式下是「已消耗票数」，旁路模式下是「调用计数」
+  const pendingOps = () => Math.max(0, maxUsedSeq - ackedSeq) + usageCount;
+
   let reason = null, pending = false, ready = null, hb = null, dev = null;
+  // C2：故障分级与自愈状态（permanent 直接拒；hard/soft 退避重试，条件消失自愈）
+  let reasonKind = null, attempts = 0, retryAt = 0, recovering = null;
+  let lastErr = null, lastOkAt = 0, lastRefillAt = 0;
   let kindUsed = 'own';                                     // 'own' | 'suite'
   let stateFile = path.join(dir, stateFileName('own'));
   // 代际号：importPack 会整体替换 lic/pool，任何"在途"的网络流程（register/bootstrap/refill/sync）
@@ -152,8 +211,24 @@ export function createGate({ pluginId, dataDir, poolTarget = 100, lowWater = 10,
   function save() {
     try {
       fs.mkdirSync(dir, { recursive: true });
+      /* WB-POOL-MERGE: 多实例共用同一票池文件（HOME 相同 ⇒ ae() 同目录），
+         全量覆盖会让后写的旧副本吞掉别的实例刚领的票 ⇒ 服务端在途虚高 ⇒ 满池锁死。
+         写盘前与磁盘合并：pool 按 seq 去重取并集，maxUsedSeq/ackedSeq 取大。 */
+      let mPool = pool.slice(), mUsed = maxUsedSeq, mAcked = ackedSeq;
+      /* WB-TICKET-FREE: saveNoMerge=1 时跳过「与磁盘合并」，用于旁路模式下清空废票 */
+      if (!saveNoMerge) try {
+        const d = JSON.parse(Buffer.from(fs.readFileSync(stateFile, 'utf-8'), 'base64').toString('utf-8'));
+        if (d && d.lic && lic && d.lic.license_id === lic.license_id) {
+          mUsed = Math.max(mUsed, d.maxUsedSeq || 0);
+          mAcked = Math.max(mAcked, d.ackedSeq || 0);
+          const have = new Set(mPool.map(t => t && t.seq));
+          for (const t of (d.pool || [])) if (t && typeof t.seq === 'number' && !have.has(t.seq)) { mPool.push(t); have.add(t.seq); }
+        }
+      } catch {}
+      saveNoMerge = false;
+      mPool = mPool.filter(t => t && t.seq > mUsed).sort((a, b) => a.seq - b.seq);
       const tmp = stateFile + '.tmp';
-      fs.writeFileSync(tmp, b64e({ key, lic, maxUsedSeq, ackedSeq, pool }));
+      fs.writeFileSync(tmp, b64e({ key, lic, maxUsedSeq: mUsed, ackedSeq: mAcked, pool: mPool, ticketFree }));   // WB-TICKET-FREE: 策略随状态落盘
       fs.renameSync(tmp, stateFile);          // 原子替换，掉电不会读到半截文件
       dirty = false; lastSave = Date.now();
     } catch (e) { logger('persist failed', e && e.message); }
@@ -201,10 +276,15 @@ export function createGate({ pluginId, dataDir, poolTarget = 100, lowWater = 10,
   };
   // 网络类原因：本机已有证（离线包/已落盘）时不该因"连不上"就关门 —— 离线包是自足授权
   const NET_REASONS = new Set(['offline_no_license', 'unavailable', 'register_failed', 'rate_limited']);
+  // C2 分级：permanent 直接拒且不自愈；hard 拒但退避重试；soft 有本地证时不阻断、无证时退避重试
+  const PERMA_REASONS = new Set(['revoked', 'unknown_plugin', 'plugin_mismatch', 'expired', 'not_active']);
+  const HARD_REASONS = new Set(['hwid_mismatch', 'device_mismatch', 'clock_tamper']);
   const close = (r) => {
     if (reason || r === 'no_ticket') return;
     if (lic && NET_REASONS.has(r)) { logger('net issue ignored (local license present)', r); return; }
-    reason = r; logger('gate closed', r);
+    reason = r;
+    reasonKind = PERMA_REASONS.has(r) ? 'permanent' : (HARD_REASONS.has(r) ? 'hard' : 'soft');
+    logger('gate closed', r, reasonKind);
   };
   const realign = () => {                        // 多实例/离线包导入后水位对齐
     if (!pool.length) return;
@@ -212,6 +292,45 @@ export function createGate({ pluginId, dataDir, poolTarget = 100, lowWater = 10,
     for (const t of pool) if (t.seq > maxUsedSeq && (min === null || t.seq < min)) min = t.seq;
     if (min !== null && min > maxUsedSeq + 1) { maxUsedSeq = min - 1; save(); }
   };
+  // ---- C2 自愈：指数退避（15s 起，封顶 10min），条件消失即恢复 ----
+  const backoffMs = (n) => Math.min(600000, 15000 * Math.pow(2, Math.max(0, n - 1)));
+  function markOk(why) {
+    if (reason) logger('gate recovered', reason, why || '');
+    reason = null; reasonKind = null; attempts = 0; retryAt = 0; lastOkAt = Date.now();
+  }
+  function recover() {
+    if (!reason || reasonKind === 'permanent') return Promise.resolve(false);
+    if (recovering) return recovering;
+    const now = Date.now();
+    if (!retryAt) { attempts += 1; retryAt = now + backoffMs(attempts); return Promise.resolve(false); }
+    if (now < retryAt) return Promise.resolve(false);
+    attempts += 1; retryAt = now + backoffMs(attempts);
+    const prev = reason;
+    recovering = (async () => {
+      try {
+        // 时钟类：先用服务端时间校准，再判一次；改对了才自愈（不绕过真异常）
+        if (prev === 'clock_tamper') {
+          await sync();
+          const t = clock.now();
+          if (clock.maxSeen - t > CLOCK_SKEW_MS) { close(prev); return false; }
+          clock.maxSeen = t;
+        }
+        // 其余：清门禁状态重跑解析链（已落盘的证与票不动）
+        reason = null; reasonKind = null; ready = null;
+        await init();
+        if (reason) return false;
+        if (!lic || (!ticketFree && !pool.length)) { close(prev); return false; }
+        attempts = 0; retryAt = 0; lastOkAt = Date.now();
+        logger('gate recovered', prev);
+        return true;
+      } catch (e) {
+        lastErr = 'recover:' + ((e && e.message) || e);
+        close(prev);
+        return false;
+      } finally { recovering = null; }
+    })();
+    return recovering;
+  }
 
   async function doInit() { return resolve(); }
 
@@ -238,6 +357,7 @@ export function createGate({ pluginId, dataDir, poolTarget = 100, lowWater = 10,
       });
       const pick = cands[0];
       lic = pick.saved.lic; key = pick.saved.key || key; kindUsed = pick.kind;
+      if (pick.saved.ticketFree) ticketFree = true;   // WB-TICKET-FREE: 离线重启沿用上次策略
       stateFile = fileOf(pick.kind);
       maxUsedSeq = pick.saved.maxUsedSeq || 0; ackedSeq = pick.saved.ackedSeq || 0;
       pool = (pick.saved.pool || []).filter(isTicket);
@@ -267,9 +387,10 @@ export function createGate({ pluginId, dataDir, poolTarget = 100, lowWater = 10,
       kindUsed = lic.plugin_id === '*' ? 'suite' : 'own';
       stateFile = fileOf(kindUsed);
       absorb(data.tickets); save(); heartbeat();
+      if (pool.length < lowWater) refill().catch(() => {});
       writeLease(kindUsed === 'suite' ? { suite_key: k } : { keys: { [pluginId]: k } });
       return true;
-    } catch { return false; }
+    } catch (e) { lastErr = 'tryKey:' + ((e && e.message) || e); return false; }
   }
 
   async function autoRegister() {
@@ -290,20 +411,21 @@ export function createGate({ pluginId, dataDir, poolTarget = 100, lowWater = 10,
       }
       if (status === 200 && data && data.approved === false) { pending = true; return; }
       close(status === 404 ? 'unknown_plugin' : status === 429 ? 'rate_limited' : 'register_failed');
-    } catch { close('offline_no_license'); }
+    } catch (e) { lastErr = ((e && e.message) || 'offline'); close('offline_no_license'); }
   }
   async function bootstrap() {
     const g = epoch;
     try {
       const { status, data } = await post('/api/client/tickets', key, { hwid: hw, plugin_id: pluginId, want: poolTarget, ...devBody() });
       if (data && data.server_time) clock.calibrate(data.server_time);
+      applyCap(data); applyTicketFree(data);
       if (status !== 200 || !data) return close('unavailable');
       if (!data.ok) return close(data.status === 'disabled' ? 'revoked' : (data.status || 'unavailable'));
       if (stale(g)) return;                                   // 期间导入过离线包，让位
       if (isLicense(data.license)) lic = data.license;
       absorb(data.tickets);
       save();
-    } catch { close('offline_no_license'); }
+    } catch (e) { lastErr = ((e && e.message) || 'offline'); close('offline_no_license'); }
   }
   // 补票并发合并。
   // 老实现用 `busy` 布尔做重入保护，第二次调用会**立刻** return false ——
@@ -314,43 +436,56 @@ export function createGate({ pluginId, dataDir, poolTarget = 100, lowWater = 10,
   let refillP = null;
   function refill() {
     if (!key) return Promise.resolve(false);
+    if (ticketFree) return Promise.resolve(false);   // WB-TICKET-FREE: 旁路模式不领票
     if (refillP) return refillP;
     refillP = doRefill().finally(() => { refillP = null; });
     return refillP;
   }
   async function doRefill() {
     const g = epoch;
+    lastRefillAt = Date.now();
     try {
       const { status, data } = await post('/api/client/tickets', key, {
         hwid: hw, plugin_id: pluginId, want: poolTarget,
-        ops_used: maxUsedSeq - ackedSeq, acked_seq: maxUsedSeq, ...devBody(),
+        ops_used: pendingOps(), acked_seq: maxUsedSeq, ...devBody(),
       });
       if (data && data.server_time) clock.calibrate(data.server_time);
-      if (status !== 200 || !data) return false;
+      applyCap(data); applyTicketFree(data);
+      if (status !== 200 || !data) { lastErr = 'refill:http_' + status; return false; }
       if (!data.ok) { close(data.status === 'disabled' ? 'revoked' : (data.status || 'unavailable')); return false; }
       if (stale(g)) return false;                             // 期间导入过离线包，让位
       if (isLicense(data.license)) lic = data.license;
       absorb(data.tickets);
-      ackedSeq = Math.max(ackedSeq, maxUsedSeq);
+      ackedSeq = Math.max(ackedSeq, maxUsedSeq); usageCount = 0;
       save();
       return (data.tickets || []).length > 0;
-    } catch { return false; }
+    } catch (e) { lastErr = 'refill:' + ((e && e.message) || e); return false; }
   }
   async function sync() {
     if (!key) return false;
     const g = epoch;
     try {
       const { data } = await post('/api/client/refresh', key, {
-        hwid: hw, plugin_id: pluginId, ops_used: maxUsedSeq - ackedSeq, acked_seq: maxUsedSeq, ...devBody(),
+        hwid: hw, plugin_id: pluginId, ops_used: pendingOps(), acked_seq: maxUsedSeq, ...devBody(),
       });
       if (data && data.server_time) clock.calibrate(data.server_time);
+      applyCap(data); applyTicketFree(data);
       if (data && data.status === 'disabled') { close('revoked'); return false; }
       if (stale(g)) return false;                             // 期间导入过离线包，让位
       if (data && data.license) { if (!isLicense(data.license)) { close('bad_signature'); return false; } lic = data.license; }
+      /* WB-TICKET-FREE: 只有确认服务端真的收了（ok/license/active 三者有其一）才清调用计数。
+         老代码不看 HTTP 状态，反代 502 / 服务端 500 也会走到这里，旁路模式下计数会静默丢失
+         （实测丢过一轮 3 次）。不清零 = 下次心跳自动重报，天然重试。 */
+      const ackedOk = !!(data && (data.ok === true || data.license || data.status === 'active'));
       ackedSeq = Math.max(ackedSeq, maxUsedSeq);
+      if (ackedOk) usageCount = 0;
       save();
+      lastOkAt = Date.now();
+      if (reason && reasonKind === 'soft') markOk('sync');
+      /* WB-POOL-ALIGN: 持有量低于目标时后台补满（1 小时内最多一次，由 lastRefillAt 节流） */
+      if (pool.length < poolTarget && Date.now() - lastRefillAt > 3600000) refill().catch(() => {});
       return true;
-    } catch { return false; }
+    } catch (e) { lastErr = 'sync:' + ((e && e.message) || e); return false; }
   }
   // 心跳合并：同一张证 55s 内只打一次（8 插件同证时把请求量压到 1/8）
   const hbFile = path.join(dir, '.hb');
@@ -368,6 +503,7 @@ export function createGate({ pluginId, dataDir, poolTarget = 100, lowWater = 10,
   function heartbeat() {
     if (hb) return;
     hb = setInterval(async () => {
+      if (reason && reasonKind !== 'permanent') { try { await recover(); } catch {} }
       const lid = lic && lic.license_id;
       if (lid && !hbDue(lid)) return;
       try { await init(); await sync(); if (lid) hbMark(lid); } catch {}
@@ -480,7 +616,7 @@ export function createGate({ pluginId, dataDir, poolTarget = 100, lowWater = 10,
     maxUsedSeq = baseSeq;
     ackedSeq = sameLic ? (base.ackedSeq || 0) : 0;
     pool = dedup;
-    reason = null; pending = false;
+    reason = null; reasonKind = null; attempts = 0; retryAt = 0; pending = false;
     realign();          // 离线包的 seq 可能不从 1 开始（同一张证多次导出），对齐水位
     save();
     writeLease(kind === 'suite' ? { suite_key: key } : { keys: { [pluginId]: key } });
@@ -496,11 +632,23 @@ export function createGate({ pluginId, dataDir, poolTarget = 100, lowWater = 10,
   gate.allow = async () => {                      // 硬门禁：消耗一张票
     await init();
     if (pending) return deny('pending');
-    if (reason) return deny(reason);
+    if (reason) { if (!(await recover())) return deny(reason); }
     if (clock.observe()) { close('clock_tamper'); return deny('clock_tamper'); }
+    /* WB-TICKET-FREE: 不约束票券 —— 只校验授权状态与有效期，不消耗票。
+       仍需「已激活」：拿不到本地证就按离线未激活拒绝（有效期是唯一管控维度）。 */
+    if (ticketFree) {
+      if (!lic) return deny('offline_no_license');
+      if (lic.status && lic.status !== 'active') {
+        return deny(lic.status === 'disabled' ? 'revoked' : 'not_active');
+      }
+      const exp = lic.expires_at ? new Date(lic.expires_at).getTime() : Infinity;
+      if (clock.now() >= exp) { close('expired'); return deny('expired'); }
+      usageCount += 1;                       // 调用计数，随下一次心跳上报
+      return { allowed: true };
+    }
     realign();
     let idx = pool.findIndex(t => t.seq === maxUsedSeq + 1);
-    if (idx < 0) { await refill(); realign(); idx = pool.findIndex(t => t.seq === maxUsedSeq + 1); }
+    if (idx < 0 && Date.now() - lastRefillAt > 10000) { await refill(); realign(); idx = pool.findIndex(t => t.seq === maxUsedSeq + 1); }
     if (idx < 0) return deny('no_ticket');
     const t = pool[idx];
     if (!isTicket(t)) { close('bad_signature'); return deny('bad_signature'); }
@@ -514,11 +662,17 @@ export function createGate({ pluginId, dataDir, poolTarget = 100, lowWater = 10,
   // 软门禁：不消耗票。⚠️ 判断"能不能用"必须同时看 ready && pool>0（线上版 ready 在 pool=0 时仍为 true）
   gate.state = async () => {
     await init();                                   // doInit 内部全 catch，不会抛
+    if (reason && reasonKind !== 'permanent') { try { recover().catch(() => {}); } catch {} }
     return {
-      ready: !reason && !pending, pending, usable: !reason && !pending && pool.length > 0,
+      ready: !reason && !pending, pending,
+      // WB-TICKET-FREE: 旁路模式下「有证有效」即可用，不看票数
+      usable: !reason && !pending && (ticketFree || pool.length > 0),
       plugin_id: pluginId, via: kindUsed, scope: lic ? (lic.plugin_id === '*' ? 'suite' : 'plugin') : null,
       license_id: lic ? lic.license_id : null, status: lic ? lic.status : null,
       expires_at: lic ? lic.expires_at : null, pool: pool.length, reason,
+      ticket_free: ticketFree, usage_pending: usageCount,
+      reason_kind: reasonKind, attempts, retry_in_ms: retryAt ? Math.max(0, retryAt - Date.now()) : 0,
+      last_err: lastErr, last_ok_at: lastOkAt || null,
       hwid: hw, machine_code: hw.slice(0, 16), server,
     };
   };
@@ -529,7 +683,7 @@ export function createGate({ pluginId, dataDir, poolTarget = 100, lowWater = 10,
   // 而且因为自动证也能用，问题会被掩盖成"授权好像生效了"。
   gate.activate = async (code) => {
     const k = String(code || '').trim();
-    ready = null; reason = null; pending = false; key = k;
+    ready = null; reason = null; reasonKind = null; attempts = 0; retryAt = 0; pending = false; key = k;
     if (k) { try { await tryKey(k); } catch {} }
     return init().then(() => gate.state());
   };

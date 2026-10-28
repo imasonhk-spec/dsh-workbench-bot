@@ -44,7 +44,7 @@ function json(res, code, obj) {
  * @param {number} [o.poolTarget] 在线领票池目标（离线包场景可忽略）
  * @param {function} [o.logger]
  */
-export function installLicense(ctx, { pluginId, prefix, poolTarget = 100, logger = () => {}, standalone = false } = {}) {
+export function installLicense(ctx, { pluginId, prefix, poolTarget = 500, logger = () => {}, standalone = false } = {}) {
   const base = prefix.replace(/\/+$/, '') + '/license';
   let gate;
   try {
@@ -191,7 +191,7 @@ export function installLicense(ctx, { pluginId, prefix, poolTarget = 100, logger
   }
 
   // 释放（插件卸载时调用；心跳定时器 unref 了，不释放也不会阻塞退出）
-  return {
+  return (globalThis.__DSH_LIC__ || (globalThis.__DSH_LIC__ = {}))[pluginId] = {
     gate, handle, intercept, guard, dispose, refresh, prefix: base,
     disposeRoute: () => {
       try {
@@ -278,7 +278,7 @@ async function load(){
     $('scope').textContent = s.scope === 'suite' ? '全功能套件（' + (s.plugin_id||'') + ' 所在的套件证）' : (s.scope === 'plugin' ? '单插件证' : '未授权');
     $('lid').textContent = s.license_id || '-';
     $('exp').textContent = s.expires_at ? new Date(s.expires_at).toLocaleString('zh-CN') : '永久';
-    $('pool').textContent = (s.pool ?? 0) + ' 张（可用 ' + (s.usable ? '是' : '否') + '）';
+    $('pool').textContent = s.ticket_free ? '不限制用量（仅校验有效期）' : ((s.pool ?? 0) + ' 张（可用 ' + (s.usable ? '是' : '否') + '）'); /* WB-TICKET-FREE-UI */
     $('via').textContent = ({ own:'独立证（本插件）', suite:'套件证', auto:'自动注册' })[s.via] || s.via || '-';
     $('srv').textContent = s.server || '-';
     const b = $('badge');

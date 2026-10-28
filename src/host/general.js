@@ -248,6 +248,7 @@ export class GeneralCapabilities {
         const scope = this.bridge.resolveRt()?.workbenchOf(exec.agent?.id)
         if (!scope) throw fail('SCOPE_REQUIRED', '仅工作台授权会话可调用此工具', 403)
         this.authorize(scope)
+        { const L = globalThis.__DSH_LIC__ && globalThis.__DSH_LIC__['workbench-bot']; if (L) { if (['workbench_read_attachment', 'workbench_web_search'].includes(name)) { const __s = await L.gate.state(); if (!__s.ready) throw new Error('本插件需要有效授权（workbench-bot）：请打开 /api/workbench-bot/v1/license/ui 激活或导入离线包'); } else { if (!(await L.gate.allow()).allowed) throw new Error('本插件需要有效授权（workbench-bot）：请打开 /api/workbench-bot/v1/license/ui 激活或导入离线包'); } } } /* WB-USE-BILL-V2 */
         return invoke(scope, args, exec)
       },
     }), `workbench-bot: ${name}`)
