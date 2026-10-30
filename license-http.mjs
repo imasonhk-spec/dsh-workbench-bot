@@ -128,16 +128,28 @@ export function installLicense(ctx, { pluginId, prefix, poolTarget = 500, logger
   let usableNow = false;
   let warmed = false;
   let warmTimer = null;
-  // ★ v1.2：静默模式下 402 彻底失效（只留 revoked 一条路），这里缓存一份供 guard 快速判
+  /* ★ v1.2：静默模式下 402 只留「被服务商停用」一条路，这里缓存两份供 guard 快速判。
+     ★ v1.2c 修正：原来 guard 只判 `if (silentNow) return false;` 就放行 —— 静默模式下
+       **连吊销都放行**，表现为「界面能开、功能全部跑」，管理员在后台点了禁止却毫无效果。
+       现在改为判 lockable（gate.state 已保证 silent 时 lockable === blockedNow）。 */
   let silentNow = true;
+  let revokedNow = false;    // 被服务商主动停用（吊销/停用证）→ 必须拦
+  let blockReason = '';
   async function refresh() {
     try {
       const st = await gate.state();
       usableNow = !!st.usable;
       silentNow = st.silent !== false;
+      /* 只有「服务商主动停用」才走 403。不能用 lockable —— 严格模式下 lockable 恒 true，
+         会把「没票」也判成 403，把正常的 402 提示吞掉。 */
+      revokedNow = st.reason === 'revoked' || st.reason === 'not_active'
+        || (st.status && st.status !== 'active');
+      blockReason = st.reason || (st.status && st.status !== 'active' ? st.status : '');
     } catch {
       usableNow = true;   // gate.state 自身抛错 → fail-open（L-A：授权层不能拖垮宿主）
       silentNow = true;
+      revokedNow = false;
+      blockReason = '';
     }
     warmed = true;
   }
@@ -153,6 +165,19 @@ export function installLicense(ctx, { pluginId, prefix, poolTarget = 500, logger
    */
   function guard(req, res) {
     if (intercept(req, res)) return true;
+    /* ★ v1.2c：先把「被服务商停用」判掉 —— 这是静默模式下唯一该拦的情形。
+       原来没有这段，静默模式下 guard 直接放行，管理员点"禁止"完全无效。 */
+    if (warmed && revokedNow) {
+      json(res, 403, {
+        ok: false,
+        code: 'LICENSE_REVOKED',
+        reason: blockReason || 'revoked',
+        message: '本插件已被服务商停用。请联系服务商恢复授权后重试。',
+        plugin_id: pluginId,
+        license_url: base + '/ui',
+      });
+      return true;
+    }
     /* ★ v1.2 SILENT：静默模式下业务接口一律放行。
        这是“装上即用”的最后一道保障 —— 即使 gate.state() 因为意外返回 usable=false，
        也不该把客户的业务请求挡成 402（那会表现为插件整个页面打不开）。 */
