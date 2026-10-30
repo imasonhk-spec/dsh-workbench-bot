@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "bundle": "@local/dsh-workbench-bot",
+  "version": "0.2.0",
+  "pluginId": "workbench-bot",
+  "title": "工作台机器人",
+  "requires": {
+    "bundlesBefore": [],
+    "hostServices": [
+      "connection",
+      "tools",
+      "webServer"
+    ],
+    "hostServicesSoft": [],
+    "pluginsOptional": []
+  },
+  "license": {
+    "gateVersion": "1.2c",
+    "gateMd5": "d27eff05335e9a57a976150865b73e7d",
+    "httpMd5": "dd31ae47fce2740154cf3e6e5d6dfeec",
+    "gatePaths": [
+      "license-gate.mjs",
+      "license-http.mjs"
+    ],
+    "panelMode": "none",
+    "panelFile": "license-panel.js"
+  },
+  "runtime": {
+    "node": ">=20",
+    "python": {
+      "min": "3.10",
+      "note": "仅用 Python 标准库，无需 pip 安装"
+    },
+    "bins": [
+      {
+        "name": "python3",
+        "required": true
+      }
+    ],
+    "models": [],
+    "services": []
+  },
+  "paths": {
+    "dataDir": {
+      "env": "DSH_HOME",
+      "default": "$DSH_HOME/workbench-bot"
+    }
+  },
+  "enhancements": []
+}
