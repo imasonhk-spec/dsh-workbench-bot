@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-workbench-bot",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "main": "index.js",
@@ -11,7 +11,13 @@
   "files": [
     "index.js",
     "src/",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "license-gate.mjs",
+    "license-http.mjs",
+    "package.json",
+    "install-manifest.json",
+    "README.md",
+    "license-panel.js"
   ],
   "dsh": {
     "bundle": {
