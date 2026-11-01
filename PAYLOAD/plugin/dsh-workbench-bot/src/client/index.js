@@ -106,7 +106,7 @@ window.__ModuleLoader__.load({
     const listeners = new Set()
     let openMain = () => {}, mount, events, timer, stopped = false, refreshPromise, refreshResult, finishRefresh, refreshAgain = false, initialized = false, eventTimer = null, pollTimer = null, eventRetry = 0, lastSeq = 0
     const notify = () => { for (const fn of listeners) fn() }
-    let layoutControl = null
+    let layoutControl = null, hideFloating = () => {}, mainActive = false
     function selectMainPanel(id) { try { layoutControl?.selectPanel(id) } catch (error) { state.error = error.message; notify() } }
     // 最大化后（主面板模式）右上角 × 还原为悬浮窗：先切回会话主面板，再重新弹出悬浮窗。
     function restoreFloating() {
@@ -119,22 +119,15 @@ window.__ModuleLoader__.load({
     function nativeNavVisible() {
       return [...document.querySelectorAll('nav[class*="panelList"]')].some(nav => nav.getBoundingClientRect().height > 0)
     }
-    let sidebarOwned = false
-    // Collapse only a sidebar this shell actually shows (the classic Agent navigation);
-    // a team view that hides the panel list is left to its owner. Expanding is allowed
-    // only for a collapse this plugin caused, so a user's own collapse preference survives.
+    // 「Bot 协作」主区与左侧导航互锁：进入主区收起导航，离开主区展开导航。
+    // 收起前必须确认原生导航真的可见（ds-bot 团队视图会隐藏它，这时不动别人的侧栏）；
+    // 展开不做归属限制：需求就是「点工作台或其他工作区时导航栏展开」，之前即使由用户手动收起，也要展开。
     function setSidebarCollapsed(collapsed) {
       if (!layoutControl) return
       const frame = sidebarFrame()
       if (!frame) return
-      const isCollapsed = frame.hasAttribute('data-sidebar-collapsed')
-      if (collapsed) {
-        if (isCollapsed || !nativeNavVisible()) return
-        try { layoutControl.toggleSidebar(); sidebarOwned = true } catch { /* layout service unavailable */ }
-        return
-      }
-      if (!sidebarOwned || !isCollapsed) { sidebarOwned = false; return }
-      sidebarOwned = false
+      if (frame.hasAttribute('data-sidebar-collapsed') === collapsed) return
+      if (collapsed && !nativeNavVisible()) return
       try { layoutControl.toggleSidebar() } catch { /* layout service unavailable */ }
     }
     const storageKey = () => `dsh.workbench.bot.v2:${state.ownerId}`
@@ -646,8 +639,16 @@ window.__ModuleLoader__.load({
                 uploadError && h('p', { className: 'wbb-error' }, uploadError), state.pending[conv.id]?.error && h('p', { className: 'wbb-error' }, state.pending[conv.id].error, h('button', { onClick: () => send(conv.id, {}, true) }, '按原消息重发')))) : h('p', { className: 'empty' }, '正在加载会话…'))),
         menu && h('div', { className: 'menu show', style: { left: menu.left, top: menu.top }, role: 'menu' }, menu.kind === 'create' ? [menuButton('＋ 新建一对一会话', () => setDialog({ kind: 'direct' })), menuButton('＋ 新建群聊', () => setDialog({ kind: 'group' }))] : menu.kind === 'mention' ? conv.members.filter(m => m.type === 'agent' && !state.agents.find(a => a.agentId === m.memberId)?.deletedAt).map(m => menuButton(agentName(m.memberId), () => { if (!d.mentions.includes(m.memberId)) draft(conv.id, { mentions: [...d.mentions,m.memberId] }) })) : menu.kind === 'navigation' ? [menuButton('回收站', () => setDialog({ kind: 'recycle' })), menuButton('打开主界面', openMain), menuButton('自定义角色', () => setDialog({ kind: 'roles' })), menuButton('创建专业 PPT 任务', () => setDialog({ kind: 'task' }))] : [menuButton('打开主界面', openMain), menuButton('会话名称与成员', () => setDialog({ kind: 'conversation', conversation: conv })), menuButton('成员与下轮模型', () => setDialog({ kind: 'models' })), menuButton('任务与产物', () => setDialog({ kind: 'runs' })), menuButton(tasksVisible ? '折叠任务摘要' : '展开任务摘要', () => setTasksVisible(!tasksVisible)), menuButton('选择外部上下文', () => setDialog({ kind: 'context' })), menuButton('创建专业 PPT 任务', () => setDialog({ kind: 'task' })), menuButton('自定义角色管理', () => setDialog({ kind: 'roles' })), menuButton('回收站', () => setDialog({ kind: 'recycle' })), !conv.isDefault && h('button', { key: 'delete', disabled: deleting, onClick: () => { setMenu(null); deleteConversation() } }, conv.kind === 'group' ? '解散群聊' : '删除私聊')]), dialogContent)
     }
+    // 主区与悬浮窗互斥：进入主区即收起悬浮窗（点导航「Bot 协作」也不会再被悬浮窗盖住），
+    // 离开主区只恢复导航、不自动弹窗；要悬浮窗就点主区标题栏的「还原为悬浮窗」。
     function MainPanel() {
-      useEffect(() => { setSidebarCollapsed(true); return () => setSidebarCollapsed(false) }, [])
+      useEffect(() => {
+        mainActive = true
+        hideFloating()
+        setSidebarCollapsed(true)
+        notify()
+        return () => { mainActive = false; setSidebarCollapsed(false); notify() }
+      }, [])
       return h(Workbench, { restore: restoreFloating })
     }
     function Overlay() {
@@ -659,7 +660,8 @@ window.__ModuleLoader__.load({
       const ref = useRef(), stopDrag = useRef()
       function clamp(point) { return { x: Math.min(Math.max(10, point.x), Math.max(10, innerWidth - (ref.current?.offsetWidth || 760) - 10)), y: Math.min(Math.max(10, point.y), Math.max(10, innerHeight - (ref.current?.offsetHeight || 620) - 10)) } }
       function open() { setVisible(true) }
-      useEffect(() => { const resize = () => setPosition(p => clamp(p)); window.addEventListener('resize', resize); window.addEventListener('workbench-bot:open', open); return () => { window.removeEventListener('resize', resize); window.removeEventListener('workbench-bot:open', open); stopDrag.current?.() } }, [])
+      const hide = () => setVisible(false)
+      useEffect(() => { hideFloating = hide; const resize = () => setPosition(p => clamp(p)); window.addEventListener('resize', resize); window.addEventListener('workbench-bot:open', open); window.addEventListener('workbench-bot:hide', hide); return () => { hideFloating = () => {}; window.removeEventListener('resize', resize); window.removeEventListener('workbench-bot:open', open); window.removeEventListener('workbench-bot:hide', hide); stopDrag.current?.() } }, [])
       function drag(e) {
         if (e.target.closest('button,input,select') || e.button !== 0 || innerWidth <= 760) return
         e.preventDefault(); const start = { x: e.clientX, y: e.clientY }, origin = position
@@ -667,7 +669,8 @@ window.__ModuleLoader__.load({
         const stop = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', stop); window.removeEventListener('pointercancel', stop); window.removeEventListener('blur', stop) }
         stopDrag.current?.(); stopDrag.current = stop; window.addEventListener('pointermove', move); window.addEventListener('pointerup', stop); window.addEventListener('pointercancel', stop); window.addEventListener('blur', stop)
       }
-      return visible ? h('section', { className: 'wbb-ui panel', style: { left: position.x, top: position.y }, ref, 'aria-label': 'DSH Bot 微信式悬浮窗' }, h(Workbench, { floating: true, maximize: () => { setVisible(false); selectMainPanel('workbench-bot'); setSidebarCollapsed(true) }, close: () => setVisible(false), drag })) : h('button', { className: 'wbb-ui launcher', onClick: open, 'aria-label': '打开 DSH Bot' }, h(BotFace), notification)
+      if (mainActive) return null
+      return visible ? h('section', { className: 'wbb-ui panel', style: { left: position.x, top: position.y }, ref, 'aria-label': 'DSH Bot 微信式悬浮窗' }, h(Workbench, { floating: true, maximize: () => { hideFloating(); selectMainPanel('workbench-bot'); setSidebarCollapsed(true) }, close: () => setVisible(false), drag })) : h('button', { className: 'wbb-ui launcher', onClick: open, 'aria-label': '打开 DSH Bot' }, h(BotFace), notification)
     }
     const Icon = ({ size }) => h(primitives.IconAgentPresetOutlineRegular || primitives.IconPluginPinwheelOutlineRegular, { size: size || 16 })
     return {
@@ -676,7 +679,7 @@ window.__ModuleLoader__.load({
         stopped = false
         let disposed = false
         layoutControl = (() => { try { return ctx.get?.('layout') || ctx.layout || null } catch { return null } })()
-        openMain = () => selectMainPanel('workbench-bot')
+        openMain = () => { hideFloating(); selectMainPanel('workbench-bot') }
         const style = document.createElement('style'); style.textContent = CSS; document.head.appendChild(style)
         const disposers = []
         mount = () => {
