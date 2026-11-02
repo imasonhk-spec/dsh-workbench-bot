@@ -1,6 +1,6 @@
 # dsh-workbench-bot 0.3.0
 
-工作台机器人（含 ds-bot）
+工作台机器人（内置 ds-bot）
 
 ## 这是什么
 
@@ -16,6 +16,7 @@
 | 后台服务（systemd unit + 应用目录） | — 无 |
 | 模型权重 | ❌ 不带（指向可配置端点） |
 | DSH 底座 | ❌ 不含（`--with-base` 自动拉取） |
+| `ds-bot`（内置，硬依赖） | ✅ 随本包安装 |
 
 ## 安装
 
@@ -29,7 +30,7 @@ sudo ./install.sh
 
 | 参数 | 作用 |
 |---|---|
-| `--with-base` | 本机没有 DSH 时，自动从 `imasonhk-spec/dsh` 拉取底座并安装 |
+| `--with-base` | 本机没有 DSH 时，自动从 `imasonhk-spec/dsh` 拉取底座 `v0.1.7-alpha.2-v2` 并安装 |
 | `--dry-run` | 只打印将要做什么，不落盘 |
 | `--skip-restart` | 装完不重启 dsh-web |
 | `--force` | 覆盖已有的 venv / 配置 |
