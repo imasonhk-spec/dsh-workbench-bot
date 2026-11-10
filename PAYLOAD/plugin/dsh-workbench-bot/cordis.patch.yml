@@ -1,0 +1,6 @@
+# @local/dsh-workbench-bot bundle patch: 向 Loader roster 插入本 bundle 行。
+# 通过 profile 的 dsh.profile.bundles 安装；不要在 profile patch 里重复插入同名 id。
+- insert:
+    - id: workbench-bot
+      name: '@local/dsh-workbench-bot'
+      config: {}

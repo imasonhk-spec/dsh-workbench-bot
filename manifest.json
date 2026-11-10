@@ -1,0 +1,35 @@
+{
+  "name": "dsh-workbench-bot",
+  "unit": "dsh-workbench-bot",
+  "version": "0.3.2",
+  "previousVersion": "0.3.1",
+  "title": "工作台机器人（含 ds-bot）",
+  "kind": "plugin",
+  "services": [],
+  "ports": [],
+  "pluginDir": "@local/dsh-workbench-bot",
+  "hasVenv": false,
+  "hasNode": false,
+  "hasHarness": false,
+  "generatedAt": "2026-11-10T12:48:10+08:00",
+  "host": "lgsj",
+  "installScope": [
+    "host-profile",
+    "all-existing-accounts"
+  ],
+  "baseRepo": "imasonhk-spec/dsh",
+  "baseTag": "v0.2.0",
+  "fsEntries": [],
+  "aptProvides": [],
+  "runtimeFrom": [],
+  "pathRemap": [
+    {
+      "from": "/home/lgsj/.dsh",
+      "to": "@DSH_HOME@"
+    },
+    {
+      "from": "/home/lgsj",
+      "to": "@USER_HOME@"
+    }
+  ]
+}
