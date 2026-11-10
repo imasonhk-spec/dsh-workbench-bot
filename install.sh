@@ -12,7 +12,7 @@
 set -euo pipefail
 
 PKG_NAME="dsh-workbench-bot"
-PKG_VERSION="0.3.0"
+PKG_VERSION="0.3.1"
 PKG_KIND="plugin"
 PLUGIN_DIR="@local/dsh-workbench-bot"
 SERVICES=""
@@ -21,10 +21,7 @@ HAS_VENV="0"
 HAS_NODE="0"
 HAS_HARNESS="0"
 BASE_REPO="imasonhk-spec/dsh"
-BASE_TAG="v0.1.7-alpha.2-v2"
-# extra-bundles（如 ds-bot）是否必须先于主插件注册。
-# dsh-workbench-bot 硬依赖 ds-bot 提供的 dsBotRt 服务，必须为 1。
-EXTRA_BUNDLES_FIRST="1"
+BASE_TAG="v0.2.0"
 
 DSH_HOME="${DSH_HOME:-}"
 # 自动探测 DSH 根目录：优先环境变量 -> 目标用户的 ~/.dsh -> 常见位置
@@ -345,7 +342,6 @@ install_plugin_to(){
   if [ "$DRY" = "1" ]; then ok "  [dry] would install to $label"; return 0; fi
 
   if [ -n "$PLUGIN_DIR" ] && [ -d "$PAYLOAD/plugin" ]; then
-    local installed_tgts=""
     for pd in "$PAYLOAD"/plugin/*/; do
       [ -d "$pd" ] || continue
       local bn; bn=$(basename "$pd")
@@ -373,19 +369,15 @@ install_plugin_to(){
       rm -rf "$tgt"
       mkdir -p "$(dirname "$tgt")"
       cp -a "$pd" "$tgt"
-      installed_tgts="$installed_tgts $tgt"
       ok "  $label: $realname -> ${tgt#$target_profile/}"
     done
-    # 权限：插件目录必须归 DSH 属主，否则 harness 读不了。
-    # 🔴 必须逐个装出来的目录 chown，不能用 `$nm/@local` 一刀切。
-    #    ds-bot 的真实包名是 'ds-bot'（无 scope），落点是 $nm/ds-bot，
-    #    完全不在 @local 下面 —— 只 chown @local 会让 ds-bot 保持
-    #    root:root，harness（User=lgsj）读不到 → inject 的 dsBotRt 永不就绪
-    #    → Bot 面板静默消失，与"没装"完全一样。这是合仓引入的隐蔽坑。
+    # 权限：插件目录必须归 DSH 属主，否则 harness 读不了
     if [ "$(id -u)" -eq 0 ] && [ -n "$DSH_OWNER" ]; then
-      for t in $installed_tgts; do
-        [ -e "$t" ] && chown -R "$DSH_OWNER" "$t" 2>/dev/null || true
-      done
+      chown -R "$DSH_OWNER" "$nm/@local" 2>/dev/null || true
+      case "$PLUGIN_DIR" in
+        @local/*) : ;;
+        *) [ -n "$PLUGIN_DIR" ] && chown -R "$DSH_OWNER" "$nm/$PLUGIN_DIR" 2>/dev/null || true ;;
+      esac
     fi
 
     # 🔴🔴 「包文件在位」≠「已加载」。
@@ -404,126 +396,46 @@ register_bundles(){
   [ -f "$pj" ] || { warn "  $label 无 package.json，跳过 bundle 注册"; return 0; }
   command -v python3 >/dev/null || { warn "  无 python3，跳过 bundle 注册"; return 0; }
 
-  # 本包要注册的 bundle id 列表。
-  # 🔴 顺序决定依赖解析成败，不能随便拼。
-  #    dsh-workbench-bot/index.js 写的是
-  #        export const inject = ['webServer','tools','dsBotRt','connection','llm']
-  #    其中 dsBotRt 由 ds-bot 提供。bundles 数组按顺序 apply 各自的 patch，
-  #    若 workbench-bot 排在 ds-bot 之前，它的 inject 解析时 dsBotRt 还不存在
-  #    → 整个 Bot 面板静默不出现（零报错），bridge.js 抛
-  #      'ds-bot 兼容入口未启用'。
-  #    线上 profile 实测顺序：ds-bot idx=10 < @local/dsh-workbench-bot idx=11。
-  #
-  #    所以：extra-bundles（被依赖方，如 ds-bot）**先**，PLUGIN_DIR（主插件）**后**。
-  #    manifest 的 extra_bundles_first 字段显式表达这个契约，未来若有插件不需要
-  #    前置依赖，置 false 即可走旧序。
-  local ids=""
+  # 本包要注册的 bundle id 列表：plugin_dir + extra_plugins
+  local ids="$PLUGIN_DIR"
   if [ -f "$PAYLOAD/extra-bundles.txt" ]; then
     while IFS= read -r l; do
       [ -n "$l" ] && ids="$ids $l"
     done < "$PAYLOAD/extra-bundles.txt"
-  fi
-  if [ "$EXTRA_BUNDLES_FIRST" = "1" ]; then
-    ids="$ids $PLUGIN_DIR"
-  else
-    ids="$PLUGIN_DIR $ids"
   fi
   [ -z "$(echo "$ids" | tr -d ' ')" ] && return 0
 
   local out
   out=$(python3 - "$pj" $ids <<'PYEOF'
 import json, os, sys
-pj = sys.argv[1]
-ids = [i for i in sys.argv[2:] if i]
-if not ids:
-    print("OK\t"); sys.exit(0)
-
+pj, ids = sys.argv[1], sys.argv[2:]
 try:
     d = json.load(open(pj, encoding="utf-8"))
 except Exception as e:
     print("ERR\t%s" % e); sys.exit(0)
-
-prof = d.setdefault("dsh", {}).setdefault("profile", {})
-bundles = prof.setdefault("bundles", [])
-
-# 🔴 守卫：bundles 为空/缺核心插件时不能直接往里塞业务插件。
-#    @deepseek-ai/dsh-base 与 dsh-web-app 是插件树的根，缺了它们的
-#    bundles 数组是畸形状态 —— 塞进去的插件 patch 没有可挂载的父树，
-#    表现是 fiber=failed 或整个 web UI 空白。此时宁可不动，报错交给人看。
-_missing_core = [c for c in ("@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app")
-                 if c not in bundles]
-if _missing_core:
-    print("ERR\tbundles 缺核心插件 %s，拒绝写入（请先装底座）"
-          % ",".join(_missing_core))
-    sys.exit(0)
-
-before = list(bundles)
-
-# 1) 补齐缺失项：按 ids 顺序追加（保证 core 插件仍在最前，
-#    否则 patch 会在核心插件树就绪前 apply，表现为 fiber=failed）
+bundles = d.setdefault("dsh", {}).setdefault("profile", {}).setdefault("bundles", [])
+added = []
 for i in ids:
-    if i not in bundles:
-        bundles.append(i)
-
-# 2) 依赖前置重排：
-#    ids 描述的是「相对先后」（被依赖方在前，依赖方在后）。
-#    只在**已被托管项占据的槽位之间**做置换，绝不移动任何非托管项
-#    （@deepseek-ai/* 核心插件的位置必须原地不动）。
-slots = [n for n, b in enumerate(bundles) if b in ids]
-managed = [i for i in ids if i in bundles]   # 目标相对顺序
-for n, b in zip(slots, managed):
-    bundles[n] = b
-
-changed = bundles != before
-if changed:
+    if not i: continue
+    if i in bundles: continue
+    # 🔴 顺序敏感：插件必须排在 @deepseek-ai/dsh-base 与 dsh-web-app 之后，
+    #    否则其 patch 会在核心插件树就绪前 apply，表现是 fiber=failed。
+    bundles.append(i)
+    added.append(i)
+if added:
     tmp = pj + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=2)
     os.replace(tmp, pj)
-print("OK\t%s\t%s" % (" ".join(managed), "reordered" if changed else "noop"))
+print("OK\t%s" % " ".join(added))
 PYEOF
 )
   case "$out" in
-    OK*)
-      local a; a=$(printf '%s' "$out" | cut -f2)
-      local st; st=$(printf '%s' "$out" | cut -f3)
-      if [ "$st" = "reordered" ]; then
-        ok "  $label: bundle 已注册并按依赖前置排序 [$a]"
-      elif [ -n "$a" ]; then
-        ok "  $label: bundle 就位 [$a]"
-      else
-        warn "  $label: bundle 列表为空"
-      fi
-      # 自检：ds-bot 必须排在依赖它的 workbench-bot 之前
-      verify_bundle_order "$prof" "$label"
-      ;;
+    OK*) local a="${out#OK	}"
+         [ -n "$a" ] && ok "  $label: bundle 已注册 [$a]" \
+                     || ok "  $label: bundle 已存在，无需重复注册" ;;
     ERR*) warn "  $label: bundle 注册失败（${out#ERR	}）" ;;
   esac
-}
-
-# 🔴 顺序自检：装完必须验，不能假设重排生效。
-#    dsh-workbench-bot inject 里有 'dsBotRt'（ds-bot 提供）。
-#    顺序错 → 面板静默消失，日志零报错，事后极难归因。
-verify_bundle_order(){
-  local prof="$1" label="$2"
-  local ids=""
-  [ -f "$PAYLOAD/extra-bundles.txt" ] && ids=$(tr '\n' ' ' < "$PAYLOAD/extra-bundles.txt")
-  local main="${PLUGIN_DIR##*/}"
-  [ -z "$ids" ] && return 0
-  python3 - "$prof/package.json" $ids "$main" <<'PYEOF' || warn "  $label: 🔴 bundle 顺序自检未通过（依赖可能不解析）"
-import json, sys
-pj, extras, main = sys.argv[1], sys.argv[2:-1], sys.argv[-1]
-b = json.load(open(pj, encoding="utf-8")).get("dsh", {}).get("profile", {}).get("bundles", [])
-mainid = "@local/" + main
-if mainid not in b:
-    sys.exit(0)
-for e in extras:
-    if e in b and b.index(e) > b.index(mainid):
-        print("    %s(idx=%d) 排在 %s(idx=%d) 之后 —— 依赖方先于被依赖方加载"
-              % (e, b.index(e), mainid, b.index(mainid)))
-        sys.exit(1)
-sys.exit(0)
-PYEOF
 }
 
 install_plugin_to "$PROFILE_DIR" "宿主 profile"
@@ -822,19 +734,6 @@ fix_shared_service(){
     sed -e "s|/home/lgsj/\.dsh|$DSH_HOME|g" \
         -e "s|/home/lgsj|$USER_HOME|g" \
         "$PAYLOAD/services/$name.service" > /tmp/_dsh_svc_unit.$$
-    # 🔴 User=/Group= 也是硬编码的源机账号名，必须一并改写。
-    #    实测 8.6 的 dsh-web.service 是 `User=lgsj`；目标机若根本没有 lgsj
-    #    这个账号，systemd 起服务时直接：
-    #        Failed to determine user credentials: No such process
-    #        dsh-web.service: Failed at step USER spawning ...
-    #    而且这条错误**不在 journal 的业务日志里**，只在 systemd 层，很容易漏看。
-    #    只在目标确实存在该用户时才改，避免把 root 跑的服务误改成普通用户。
-    local _uname; _uname="${DSH_OWNER%%:*}"
-    if [ -n "$_uname" ] && [ "$_uname" != "root" ] && id "$_uname" >/dev/null 2>&1; then
-      sed -i -E "s|^User=.*|User=${_uname}|" /tmp/_dsh_svc_unit.$$
-      # Group 若写了具体值也一起改（留空/systemd 默认则不动）
-      sed -i -E "s|^Group=lgsj$|Group=${_uname}|" /tmp/_dsh_svc_unit.$$
-    fi
     # 现场生成 __GEN__ 密钥
     while grep -q '__GEN__' /tmp/_dsh_svc_unit.$$ 2>/dev/null; do
       local v; v=$(gen_secret 32)
